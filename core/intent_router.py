@@ -1,7 +1,11 @@
-"""Intent Router — asks LLM to classify input into a structured intent+args dict.
+"""Intent Router v2 — structured schema + few-shot examples + output validation.
 
-Replaces keyword matching. Every plugin registers its intents here.
-The LLM returns JSON: {"intent": "plugin.action", "args": {...}}
+Improvements over v1:
+  - Compact schema (name + args spec only, no verbose descriptions)
+  - Few-shot examples baked into system prompt
+  - Output validated + coerced before returning
+  - Retries once on bad JSON
+  - Shared LLM call helper to avoid code duplication
 """
 
 import json
@@ -9,135 +13,283 @@ import urllib.request
 import urllib.error
 from core.config import get_llm_config
 
-# ── Intent registry ────────────────────────────────────────────────────────
-# Each entry: "plugin.action": "plain english description of when to use + args"
+# ─────────────────────────────────────────────────────────────────────
+# Intent schema: {intent_id: {arg_name: type_hint}}
+# Empty dict = no args needed.
+# ─────────────────────────────────────────────────────────────────────
 
-INTENT_REGISTRY = {
-    # system
-    "system.stats"    : "User wants CPU, RAM, disk, or memory usage stats. args: {}",
-    "system.uptime"   : "User asks how long Jarvis has been running. args: {}",
-    "system.sysinfo"  : "User asks about OS, platform, Python version, machine info. args: {}",
-    "system.shell"    : "User wants to run a terminal/shell command. args: {\"cmd\": \"<command string>\"}",
-    "system.open"     : "User wants to open an application or file by name. args: {\"target\": \"<app or path>\"}",
-    "system.env"      : "User wants to read an environment variable. args: {\"key\": \"<VAR_NAME or empty for all>\"}",
-    "system.setenv"   : "User wants to set an environment variable. args: {\"key\": \"KEY\", \"value\": \"VALUE\"}",
+INTENT_SCHEMA: dict[str, dict] = {
+    # —— system ——
+    "system.stats"   : {},
+    "system.uptime"  : {},
+    "system.sysinfo" : {},
+    "system.shell"   : {"cmd": "str"},
+    "system.open"    : {"target": "str"},
+    "system.env"     : {"key": "str?"},        # optional
+    "system.setenv"  : {"key": "str", "value": "str"},
 
-    # filesystem
-    "fs.find"         : "User wants to find or search for a file by name or pattern. args: {\"pattern\": \"<glob>\"}",
-    "fs.read"         : "User wants to read or view contents of a file. args: {\"path\": \"<path>\"}",
-    "fs.list"         : "User wants to list files in a directory. args: {\"path\": \"<dir path or .>\"}",
-    "fs.move"         : "User wants to move or rename a file. args: {\"src\": \"<source>\", \"dst\": \"<destination>\"}",
-    "fs.delete"       : "User wants to delete a file. args: {\"path\": \"<path>\"}",
-    "fs.mkdir"        : "User wants to create a directory. args: {\"path\": \"<path>\"}",
-    "fs.pwd"          : "User wants to know the current working directory. args: {}",
+    # —— filesystem ——
+    "fs.find"        : {"pattern": "str"},
+    "fs.read"        : {"path": "str"},
+    "fs.list"        : {"path": "str?"},
+    "fs.move"        : {"src": "str", "dst": "str"},
+    "fs.delete"      : {"path": "str"},
+    "fs.mkdir"       : {"path": "str"},
+    "fs.pwd"         : {},
 
-    # process
-    "process.list"    : "User wants to see running processes. args: {}",
-    "process.kill"    : "User wants to kill or stop a process by name or PID. args: {\"target\": \"<name or pid>\"}",
-    "process.find"    : "User wants to find a specific running process. args: {\"name\": \"<process name>\"}",
+    # —— process ——
+    "process.list"   : {},
+    "process.kill"   : {"target": "str"},
+    "process.find"   : {"name": "str"},
 
-    # network
-    "net.ping"        : "User wants to ping a host. args: {\"host\": \"<hostname or ip>\"}",
-    "net.curl"        : "User wants to fetch a URL or make an HTTP GET request. args: {\"url\": \"<url>\"}",
-    "net.download"    : "User wants to download a file from a URL. args: {\"url\": \"<url>\"}",
-    "net.portscan"    : "User wants to scan ports on a host. args: {\"host\": \"<hostname or ip>\"}",
-    "net.myip"        : "User wants to know their public IP address. args: {}",
-    "net.ipinfo"      : "User wants info about an IP address. args: {\"ip\": \"<ip or domain>\"}",
-    "net.dns"         : "User wants to resolve a hostname via DNS. args: {\"host\": \"<hostname>\"}",
-    "net.checkurl"    : "User wants to check if a website or URL is up. args: {\"url\": \"<url>\"}",
-    "net.localip"     : "User wants their local IP or hostname. args: {}",
-    "net.speedtest"   : "User wants to test their internet download speed. args: {}",
+    # —— network ——
+    "net.ping"       : {"host": "str"},
+    "net.curl"       : {"url": "str"},
+    "net.download"   : {"url": "str"},
+    "net.portscan"   : {"host": "str"},
+    "net.myip"       : {},
+    "net.ipinfo"     : {"ip": "str"},
+    "net.dns"        : {"host": "str"},
+    "net.checkurl"   : {"url": "str"},
+    "net.localip"    : {},
+    "net.speedtest"  : {},
 
-    # clipboard
-    "clip.read"       : "User wants to read or see what is in the clipboard. args: {}",
-    "clip.write"      : "User wants to copy something to the clipboard. args: {\"content\": \"<text>\"}",
+    # —— clipboard ——
+    "clip.read"      : {},
+    "clip.write"     : {"content": "str"},
 
-    # notify
-    "notify.send"     : "User wants to send a desktop notification or alert. args: {\"message\": \"<text>\"}",
+    # —— notify ——
+    "notify.send"    : {"message": "str"},
 
-    # scheduler
-    "scheduler.add"   : "User wants to set a reminder or schedule something. args: {\"delay_seconds\": <int>, \"message\": \"<text>\", \"repeat\": \"\" or \"minutely\" or \"hourly\" or \"daily\"}",
-    "scheduler.list"  : "User wants to see pending reminders. args: {}",
-    "scheduler.cancel": "User wants to cancel a reminder by ID. args: {\"id\": <int>}",
+    # —— scheduler ——
+    "scheduler.add"  : {"delay_seconds": "int", "message": "str", "repeat": "str?"},
+    "scheduler.list" : {},
+    "scheduler.cancel": {"id": "int"},
 
-    # notes
-    "notes.save"      : "User wants to save a note or remember something. args: {\"content\": \"<text>\", \"tag\": \"<optional tag>\"}",
-    "notes.list"      : "User wants to see their notes. args: {\"tag\": \"<optional tag>\"}",
-    "notes.search"    : "User wants to search their notes. args: {\"query\": \"<search term>\"}",
-    "notes.delete"    : "User wants to delete a note by ID. args: {\"id\": <int>}",
-    "notes.history"   : "User wants to see conversation history. args: {}",
-    "notes.forget"    : "User wants to wipe all memory/history. args: {}",
+    # —— notes ——
+    "notes.save"     : {"content": "str", "tag": "str?"},
+    "notes.list"     : {"tag": "str?"},
+    "notes.search"   : {"query": "str"},
+    "notes.delete"   : {"id": "int"},
+    "notes.history"  : {},
+    "notes.forget"   : {},
 
-    # launcher
-    "launcher.workspace" : "User wants to open/launch a named workspace. args: {\"name\": \"<workspace name>\"}",
-    "launcher.list"      : "User wants to list available workspaces. args: {}",
+    # —— launcher ——
+    "launcher.workspace": {"name": "str"},
+    "launcher.list"     : {},
 
-    # llm (fallback)
-    "llm.chat"        : "None of the above apply. User wants a general answer or conversation. args: {}",
+    # —— fallback ——
+    "llm.chat"       : {},
 }
 
+# Required args (non-optional) per intent for validation
+_REQUIRED: dict[str, list] = {
+    k: [a for a, t in v.items() if not t.endswith("?")]
+    for k, v in INTENT_SCHEMA.items()
+}
 
-_SYSTEM_PROMPT = """You are an intent classifier for an AI assistant called Jarvis.
-Given the user's message, return ONLY a JSON object with:
-  {"intent": "<intent_id>", "args": {<extracted args>}}
+# ─────────────────────────────────────────────────────────────────────
+# Few-shot examples — teach the model intent + arg extraction
+# ─────────────────────────────────────────────────────────────────────
 
-Available intents:
-"""
+_EXAMPLES = [
+    # system
+    ("how much ram am i using",                   '{"intent":"system.stats","args":{}}'),
+    ("run git status",                             '{"intent":"system.shell","args":{"cmd":"git status"}}'),
+    ("open vscode",                                '{"intent":"system.open","args":{"target":"code"}}'),
+    ("what os am i on",                            '{"intent":"system.sysinfo","args":{}}'),
+    ("set HOME_DIR to /home/shahil",               '{"intent":"system.setenv","args":{"key":"HOME_DIR","value":"/home/shahil"}}'),
+
+    # filesystem
+    ("show me what's in ~/downloads",              '{"intent":"fs.list","args":{"path":"~/downloads"}}'),
+    ("find all python files",                      '{"intent":"fs.find","args":{"pattern":"*.py"}}'),
+    ("read the config file at ./config.yaml",      '{"intent":"fs.read","args":{"path":"./config.yaml"}}'),
+    ("rename old.txt to new.txt",                  '{"intent":"fs.move","args":{"src":"old.txt","dst":"new.txt"}}'),
+    ("create a folder called backups",             '{"intent":"fs.mkdir","args":{"path":"backups"}}'),
+    ("where am i",                                 '{"intent":"fs.pwd","args":{}}'),
+
+    # process
+    ("what processes are eating my cpu",           '{"intent":"process.list","args":{}}'),
+    ("kill chrome",                                '{"intent":"process.kill","args":{"target":"chrome"}}'),
+    ("is nginx running",                           '{"intent":"process.find","args":{"name":"nginx"}}'),
+
+    # network
+    ("ping google.com",                            '{"intent":"net.ping","args":{"host":"google.com"}}'),
+    ("is github down",                             '{"intent":"net.checkurl","args":{"url":"https://github.com"}}'),
+    ("what's my public ip",                        '{"intent":"net.myip","args":{}}'),
+    ("scan ports on 192.168.1.1",                  '{"intent":"net.portscan","args":{"host":"192.168.1.1"}}'),
+    ("download https://example.com/file.zip",      '{"intent":"net.download","args":{"url":"https://example.com/file.zip"}}'),
+    ("what city is 8.8.8.8 in",                    '{"intent":"net.ipinfo","args":{"ip":"8.8.8.8"}}'),
+    ("check my internet speed",                    '{"intent":"net.speedtest","args":{}}'),
+
+    # clipboard
+    ("what's in my clipboard",                     '{"intent":"clip.read","args":{}}'),
+    ("copy 'hello world' to clipboard",            '{"intent":"clip.write","args":{"content":"hello world"}}'),
+
+    # notify
+    ("send me a notification: build done",         '{"intent":"notify.send","args":{"message":"build done"}}'),
+
+    # scheduler - time conversion examples
+    ("remind me in 10 minutes to call John",       '{"intent":"scheduler.add","args":{"delay_seconds":600,"message":"call John","repeat":""}}'),
+    ("remind me to clean my godown drive in 2 hours", '{"intent":"scheduler.add","args":{"delay_seconds":7200,"message":"clean godown drive","repeat":""}}'),
+    ("remind me every day to drink water",         '{"intent":"scheduler.add","args":{"delay_seconds":86400,"message":"drink water","repeat":"daily"}}'),
+    ("show my reminders",                          '{"intent":"scheduler.list","args":{}}'),
+    ("cancel reminder 3",                          '{"intent":"scheduler.cancel","args":{"id":3}}'),
+
+    # notes
+    ("remember this: fix the auth bug #work",      '{"intent":"notes.save","args":{"content":"fix the auth bug","tag":"work"}}'),
+    ("show all my notes",                          '{"intent":"notes.list","args":{}}'),
+    ("search notes for docker",                    '{"intent":"notes.search","args":{"query":"docker"}}'),
+    ("what did i say earlier",                     '{"intent":"notes.history","args":{}}'),
+
+    # launcher
+    ("open my dev workspace",                      '{"intent":"launcher.workspace","args":{"name":"dev"}}'),
+    ("what workspaces do i have",                  '{"intent":"launcher.list","args":{}}'),
+
+    # llm fallback
+    ("explain how docker networking works",        '{"intent":"llm.chat","args":{}}'),
+    ("what's the capital of japan",                '{"intent":"llm.chat","args":{}}'),
+]
 
 
-def build_classifier_prompt() -> str:
-    lines = []
-    for intent, desc in INTENT_REGISTRY.items():
-        lines.append(f"  {intent}: {desc}")
-    return _SYSTEM_PROMPT + "\n".join(lines) + """
+def _build_system_prompt() -> str:
+    # Compact schema block
+    schema_lines = []
+    for intent, args in INTENT_SCHEMA.items():
+        args_str = json.dumps(args) if args else "{}"
+        schema_lines.append(f"  {intent}: {args_str}")
+    schema_block = "\n".join(schema_lines)
+
+    # Few-shot block (last 12 examples, rotated to keep prompt small)
+    shot_lines = []
+    for user, out in _EXAMPLES[-12:]:
+        shot_lines.append(f'User: "{user}"\nOutput: {out}')
+    shots = "\n\n".join(shot_lines)
+
+    return f"""You are an intent classifier for an AI OS assistant called Jarvis.
+
+Return ONLY a JSON object: {{"intent": "<id>", "args": {{...}}}}
+No markdown. No explanation. One line.
 
 Rules:
-- Return ONLY valid JSON. No explanation, no markdown.
-- Pick the single best matching intent.
-- Extract args precisely from the user message.
-- If delay is mentioned (e.g. '10 minutes'), convert to seconds in delay_seconds.
-- Default to llm.chat if nothing matches."""
+- Pick the single best intent from the schema below.
+- Extract ALL required args precisely from the user message.
+- For time: convert to delay_seconds (minutes*60, hours*3600, days*86400).
+- Strip filler words from messages (remind me to / please / can you).
+- If nothing fits, use llm.chat with empty args.
+
+Schema:
+{schema_block}
+
+Examples:
+{shots}"""
 
 
-def classify(text: str) -> dict:
-    """
-    Send text to LLM for intent classification.
-    Returns {"intent": str, "args": dict} or fallback to llm.chat.
-    """
+# Cache the prompt (built once per process)
+_CACHED_PROMPT: str | None = None
+
+
+def _system_prompt() -> str:
+    global _CACHED_PROMPT
+    if _CACHED_PROMPT is None:
+        _CACHED_PROMPT = _build_system_prompt()
+    return _CACHED_PROMPT
+
+
+# ─────────────────────────────────────────────────────────────────────
+# LLM call + parse
+# ─────────────────────────────────────────────────────────────────────
+
+def _llm_call(user_text: str) -> str:
+    """Raw LLM call. Returns the model's text output."""
     cfg = get_llm_config()
-    base_url = cfg.get("base_url", "").rstrip("/")
-    api_key  = cfg.get("api_key", "")
-    model    = cfg.get("model", "")
-
     payload = json.dumps({
-        "model": model,
-        "messages": [
-            {"role": "system", "content": build_classifier_prompt()},
-            {"role": "user",   "content": text},
+        "model"      : cfg.get("model", ""),
+        "messages"   : [
+            {"role": "system", "content": _system_prompt()},
+            {"role": "user",   "content": user_text},
         ],
-        "max_tokens": 150,
-        "temperature": 0.0,  # deterministic for classification
+        "max_tokens" : 120,     # intent JSON never needs more
+        "temperature": 0.0,     # fully deterministic
     }).encode()
 
     req = urllib.request.Request(
-        f"{base_url}/chat/completions",
+        f"{cfg['base_url'].rstrip('/')}/chat/completions",
         data=payload,
         headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
+            "Content-Type" : "application/json",
+            "Authorization": f"Bearer {cfg.get('api_key','')}",
         },
         method="POST",
     )
+    with urllib.request.urlopen(req, timeout=15) as r:
+        data = json.loads(r.read())
+    return data["choices"][0]["message"]["content"].strip()
 
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data  = json.loads(resp.read())
-            raw   = data["choices"][0]["message"]["content"].strip()
-            # Strip markdown fences if model wraps in ```json
-            raw   = raw.strip("`").lstrip("json").strip()
-            result = json.loads(raw)
-            if "intent" not in result:
-                raise ValueError("missing intent")
-            return result
-    except Exception as e:
-        return {"intent": "llm.chat", "args": {}, "_error": str(e)}
+
+def _parse(raw: str) -> dict:
+    """Extract JSON from model output, strip markdown fences if present."""
+    raw = raw.strip()
+    # strip ```json ... ``` or ``` ... ```
+    if raw.startswith("```"):
+        raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+    # find first { ... }
+    start = raw.find("{")
+    end   = raw.rfind("}")
+    if start != -1 and end != -1:
+        raw = raw[start:end+1]
+    return json.loads(raw)
+
+
+def _validate(result: dict) -> dict:
+    """Ensure intent exists in schema and required args are present.
+    Coerces int args from strings. Falls back to llm.chat on failure.
+    """
+    intent = result.get("intent", "")
+    args   = result.get("args", {})
+
+    if intent not in INTENT_SCHEMA:
+        return {"intent": "llm.chat", "args": {}}
+
+    schema = INTENT_SCHEMA[intent]
+    # Coerce types
+    for arg, typ in schema.items():
+        base_typ = typ.rstrip("?")
+        if arg in args and base_typ == "int":
+            try:
+                args[arg] = int(args[arg])
+            except (ValueError, TypeError):
+                pass
+
+    # Check required args present
+    for arg in _REQUIRED.get(intent, []):
+        if arg not in args or args[arg] == "" or args[arg] is None:
+            # Missing required arg — fall back to LLM chat
+            return {"intent": "llm.chat", "args": {}, "_missing": arg}
+
+    return {"intent": intent, "args": args}
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Public API
+# ─────────────────────────────────────────────────────────────────────
+
+def classify(text: str) -> dict:
+    """
+    Classify user text into {intent, args}.
+    Retries once on bad JSON. Always returns a valid dict.
+    """
+    for attempt in range(2):
+        try:
+            raw    = _llm_call(text)
+            result = _parse(raw)
+            return _validate(result)
+        except json.JSONDecodeError:
+            if attempt == 0:
+                continue   # retry once
+            return {"intent": "llm.chat", "args": {}, "_error": "json_decode_failed"}
+        except urllib.error.URLError as e:
+            return {"intent": "llm.chat", "args": {}, "_error": str(e)}
+        except Exception as e:
+            return {"intent": "llm.chat", "args": {}, "_error": str(e)}
+    return {"intent": "llm.chat", "args": {}}
