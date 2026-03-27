@@ -1,38 +1,24 @@
-"""Scheduler plugin v2 — reminders with snooze, reschedule, at-time, recurring."""
+"""Scheduler plugin v3 — migrated to core.db (WAL, migrations, no raw sqlite3).
+
+All SQLite access now goes through core.db.DB:
+  • WAL mode             — background ticker and REPL never block each other.
+  • Single migration      — schema is applied exactly once on first run.
+  • No sqlite3 imports    — the plugin itself only imports from core.db.
+
+Everything else (time parsing, repeat logic, notifications, snooze,
+reschedule) is unchanged from v2.
+"""
 
 import time
 import threading
-import sqlite3
 import os
 import re
 from plugins.base import PluginBase
 from core.config import get
+from core.db import DB
 
 
-def _db_path() -> str:
-    raw = get("memory", {}).get("db_path", "~/.jarvis/memory.db")
-    return os.path.expanduser(raw)
-
-
-def _init_db(path: str):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    con = sqlite3.connect(path)
-    con.executescript("""
-        CREATE TABLE IF NOT EXISTS reminders (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
-            fire_at    REAL    NOT NULL,
-            message    TEXT    NOT NULL,
-            repeat     TEXT    DEFAULT '',
-            snooze_min INTEGER DEFAULT 5,
-            done       INTEGER DEFAULT 0,
-            created_at REAL    DEFAULT (strftime('%s','now'))
-        );
-    """)
-    con.commit()
-    con.close()
-
-
-# ── time parsing ──────────────────────────────────────────────────
+# ── time parsing helpers ───────────────────────────────────────────────────
 
 _UNITS = {
     "s": 1, "sec": 1, "secs": 1, "second": 1, "seconds": 1,
@@ -50,12 +36,11 @@ _REPEAT_MAP = {
 
 
 def _parse_delay(text: str) -> int | None:
-    """Parse 'in X unit' or 'X unit' patterns. Returns seconds or None."""
     m = re.search(r"\bin\s+(\d+)\s*(\w+)", text.lower())
     if not m:
         m = re.search(r"(\d+)\s*(\w+)\s*(?:from now|later)", text.lower())
     if m:
-        n, unit = int(m.group(1)), m.group(2).lower().rstrip("s") + "s"
+        n, unit = int(m.group(1)), m.group(2).lower()
         mult = _UNITS.get(unit) or _UNITS.get(unit.rstrip("s"))
         if mult:
             return n * mult
@@ -63,33 +48,23 @@ def _parse_delay(text: str) -> int | None:
 
 
 def _parse_at_time(text: str) -> float | None:
-    """Parse 'at HH:MM' or 'at H:MM am/pm'. Returns epoch or None."""
     m = re.search(r"\bat\s+(\d{1,2}):(\d{2})\s*(am|pm)?", text.lower())
     if not m:
         m = re.search(r"\bat\s+(\d{1,2})\s*(am|pm)", text.lower())
         if m:
-            hour = int(m.group(1))
-            meridiem = m.group(2)
-            minute = 0
+            hour, minute, meridiem = int(m.group(1)), 0, m.group(2)
         else:
             return None
     else:
-        hour, minute = int(m.group(1)), int(m.group(2))
-        meridiem = m.group(3) or ""
+        hour, minute, meridiem = int(m.group(1)), int(m.group(2)), (m.group(3) or "")
 
-    if meridiem == "pm" and hour != 12:
-        hour += 12
-    elif meridiem == "am" and hour == 12:
-        hour = 0
+    if meridiem == "pm" and hour != 12: hour += 12
+    elif meridiem == "am" and hour == 12: hour = 0
 
     now   = time.localtime()
-    epoch = time.mktime((
-        now.tm_year, now.tm_mon, now.tm_mday,
-        hour, minute, 0, now.tm_wday, now.tm_yday, now.tm_isdst
-    ))
-    if epoch < time.time():
-        epoch += 86400  # next day if time already passed
-    return epoch
+    epoch = time.mktime((now.tm_year, now.tm_mon, now.tm_mday,
+                         hour, minute, 0, now.tm_wday, now.tm_yday, now.tm_isdst))
+    return epoch if epoch > time.time() else epoch + 86400
 
 
 def _parse_repeat(text: str) -> str:
@@ -100,7 +75,7 @@ def _parse_repeat(text: str) -> str:
     return ""
 
 
-def _strip_reminder_boilerplate(text: str) -> str:
+def _strip_boilerplate(text: str) -> str:
     text = re.sub(r"remind(\s+me)?(\s+to)?", "", text, flags=re.I)
     text = re.sub(r"\bat\s+\d{1,2}(:\d{2})?\s*(am|pm)?", "", text, flags=re.I)
     text = re.sub(r"\bin\s+\d+\s*\w+", "", text, flags=re.I)
@@ -109,11 +84,10 @@ def _strip_reminder_boilerplate(text: str) -> str:
     return text.strip(" ,.:;\"'")
 
 
-# ── notification ───────────────────────────────────────────────
+# ── notification ───────────────────────────────────────────────────────────
 
-def _notify(message: str):
-    import platform
-    import subprocess
+def _notify(message: str) -> None:
+    import platform, subprocess
     sys = platform.system()
     try:
         if sys == "Darwin":
@@ -121,14 +95,13 @@ def _notify(message: str):
                 f'display notification "{message}" with title "Jarvis Reminder"'],
                 check=False)
         elif sys == "Windows":
-            # Use PowerShell toast
             ps = (
-                f'[Windows.UI.Notifications.ToastNotificationManager, '
-                f'Windows.UI.Notifications, ContentType=WindowsRuntime] | Out-Null;'
-                f'$t = [Windows.UI.Notifications.ToastNotificationManager]'
+                f'[Windows.UI.Notifications.ToastNotificationManager,'
+                f'Windows.UI.Notifications,ContentType=WindowsRuntime]|Out-Null;'
+                f'$t=[Windows.UI.Notifications.ToastNotificationManager]'
                 f'::GetTemplateContent(0);'
-                f'$t.GetElementsByTagName("text")[0].InnerText = "{message}";'
-                f'$n = [Windows.UI.Notifications.ToastNotification]::new($t);'
+                f'$t.GetElementsByTagName("text")[0].InnerText="{message}";'
+                f'$n=[Windows.UI.Notifications.ToastNotification]::new($t);'
                 f'[Windows.UI.Notifications.ToastNotificationManager]'
                 f'::CreateToastNotifier("Jarvis").Show($n)'
             )
@@ -141,86 +114,101 @@ def _notify(message: str):
     print(f"\n\033[93m⏰ [Reminder] {message}\033[0m\nYou: ", end="", flush=True)
 
 
-# ── background ticker ─────────────────────────────────────────────
+# ── background ticker ──────────────────────────────────────────────────────
+# Uses its own DB() instance so the ticker thread has its own connection.
 
 _ticker_started = False
 _ticker_lock    = threading.Lock()
 
 
-def _ticker(path: str):
+def _ticker(db_path: str) -> None:
+    db = DB(db_path)
     while True:
         try:
-            con = sqlite3.connect(path, timeout=5)
             now = time.time()
-            due = con.execute(
-                "SELECT id, message, repeat, snooze_min "
-                "FROM reminders WHERE fire_at<=? AND done=0",
-                (now,)
-            ).fetchall()
-            for rid, msg, repeat, snooze_min in due:
-                _notify(msg)
-                if repeat:
-                    interval = _REPEAT_MAP.get(repeat, 86400)
-                    con.execute("UPDATE reminders SET fire_at=? WHERE id=?",
-                                (now + interval, rid))
+            due = db.fetchall(
+                "SELECT id, message, repeat FROM reminders "
+                "WHERE fire_at<=? AND done=0", (now,)
+            )
+            for row in due:
+                _notify(row["message"])
+                if row["repeat"]:
+                    interval = _REPEAT_MAP.get(row["repeat"], 86400)
+                    db.execute("UPDATE reminders SET fire_at=? WHERE id=?",
+                               (now + interval, row["id"]))
                 else:
-                    con.execute("UPDATE reminders SET done=1 WHERE id=?", (rid,))
-            if due:
-                con.commit()
-            con.close()
-        except Exception:
-            pass
+                    db.execute("UPDATE reminders SET done=1 WHERE id=?",
+                               (row["id"],))
+        except Exception as exc:
+            print(f"[scheduler ticker] {exc}")
         time.sleep(5)
 
 
-def _ensure_ticker(path: str):
+def _ensure_ticker(db_path: str) -> None:
     global _ticker_started
     with _ticker_lock:
         if not _ticker_started:
-            threading.Thread(target=_ticker, args=(path,), daemon=True).start()
+            threading.Thread(target=_ticker, args=(db_path,), daemon=True).start()
             _ticker_started = True
 
 
-# ── Plugin ─────────────────────────────────────────────────────
+# ── Plugin ─────────────────────────────────────────────────────────────────
 
 class Plugin(PluginBase):
     priority = 22
 
     def __init__(self):
-        self._db = _db_path()
-        _init_db(self._db)
-        _ensure_ticker(self._db)
+        self._db = DB()
+        self._db.migrate("scheduler_001_reminders", """
+            CREATE TABLE IF NOT EXISTS reminders (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                fire_at    REAL    NOT NULL,
+                message    TEXT    NOT NULL,
+                repeat     TEXT    DEFAULT '',
+                snooze_min INTEGER DEFAULT 5,
+                done       INTEGER DEFAULT 0,
+                created_at REAL    DEFAULT (strftime('%s','now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_reminders_fire ON reminders(fire_at, done);
+        """)
+        _ensure_ticker(self._db.path)
 
     def matches(self, text: str) -> bool:
-        t = text.lower()
-        return any(kw in t for kw in (
-            "remind", "reminder", "schedule", "snooze", "reschedule",
-        ))
+        return any(kw in text.lower() for kw in
+                   ("remind", "reminder", "schedule", "snooze", "reschedule"))
 
     def run(self, text: str, memory) -> str:
         t = text.lower()
         if any(k in t for k in ("list reminder", "show reminder", "my reminder")): return self._list()
         if any(k in t for k in ("cancel reminder", "delete reminder")): return self._cancel(text)
-        if "snooze" in t: return self._snooze(text)
-        if "reschedule" in t: return self._reschedule(text)
+        if "snooze"      in t: return self._snooze(text)
+        if "reschedule"  in t: return self._reschedule(text)
         return self._add(text)
 
-    # ── public API called by dispatcher ──────────────────────────────
+    # ------------------------------------------------------------------ #
+    # Public API called directly by dispatcher
+    # ------------------------------------------------------------------ #
 
-    def add_structured(self, delay_seconds: int = 0, message: str = "Reminder!",
-                       repeat: str = "", fire_at: float = 0.0,
-                       snooze_min: int = 5) -> str:
-        at = fire_at if fire_at else time.time() + max(delay_seconds, 1)
-        con = sqlite3.connect(self._db)
-        cur = con.execute(
+    def add_structured(
+        self,
+        delay_seconds: int  = 0,
+        message: str        = "Reminder!",
+        repeat: str         = "",
+        fire_at: float      = 0.0,
+        snooze_min: int     = 5,
+    ) -> str:
+        at  = fire_at if fire_at else time.time() + max(int(delay_seconds), 1)
+        rid = self._db.insert(
             "INSERT INTO reminders (fire_at, message, repeat, snooze_min) VALUES (?,?,?,?)",
             (at, message, repeat, snooze_min)
         )
-        rid = cur.lastrowid
-        con.commit(); con.close()
         when = time.strftime("%d %b %H:%M", time.localtime(at))
         rep  = f"  [↺ {repeat}]" if repeat else ""
         return f"⏰ Reminder #{rid} set for {when}{rep}: {message}"
+
+    # ------------------------------------------------------------------ #
+    # Internal handlers
+    # ------------------------------------------------------------------ #
 
     def _add(self, text: str) -> str:
         fire_at = _parse_at_time(text)
@@ -232,76 +220,65 @@ class Plugin(PluginBase):
                 "  remind me at 3pm to review PR\n"
                 "  remind me every day to drink water"
             )
-        msg    = _strip_reminder_boilerplate(text) or "Reminder!"
+        msg    = _strip_boilerplate(text) or "Reminder!"
         repeat = _parse_repeat(text)
         return self.add_structured(
             delay_seconds=int(delay or 0),
-            message=msg, repeat=repeat, fire_at=fire_at or 0.0
+            message=msg, repeat=repeat,
+            fire_at=fire_at or 0.0
         )
 
     def _list(self) -> str:
-        con  = sqlite3.connect(self._db)
-        rows = con.execute(
+        rows = self._db.fetchall(
             "SELECT id, fire_at, message, repeat FROM reminders "
             "WHERE done=0 ORDER BY fire_at"
-        ).fetchall()
-        con.close()
+        )
         if not rows:
             return "No pending reminders."
         lines = []
-        for rid, fa, msg, rep in rows:
-            when = time.strftime("%d %b %H:%M", time.localtime(fa))
-            rep_s = f" [↺{rep}]" if rep else ""
-            lines.append(f"#{rid:<3} {when}{rep_s:<12}  {msg}")
+        for r in rows:
+            when  = time.strftime("%d %b %H:%M", time.localtime(r["fire_at"]))
+            rep_s = f" [↺{r['repeat']}]" if r["repeat"] else ""
+            lines.append(f"#{r['id']:<3} {when}{rep_s:<12}  {r['message']}")
         return "Reminders:\n" + "\n".join(lines)
 
     def _cancel(self, text: str) -> str:
         m = re.search(r"#?(\d+)", text)
         if not m:
             return "Usage: cancel reminder <id>"
-        rid = int(m.group(1))
-        con = sqlite3.connect(self._db)
-        affected = con.execute(
+        rid      = int(m.group(1))
+        affected = self._db.execute(
             "UPDATE reminders SET done=1 WHERE id=? AND done=0", (rid,)
         ).rowcount
-        con.commit(); con.close()
         return f"Reminder #{rid} cancelled." if affected else f"Reminder #{rid} not found."
 
     def _snooze(self, text: str) -> str:
-        """Snooze a reminder: 'snooze reminder 3 for 10 minutes'"""
         m_id  = re.search(r"#?(\d+)", text)
-        delay = _parse_delay(text) or 300  # default 5 min
+        delay = _parse_delay(text) or 300
         if not m_id:
             return "Usage: snooze reminder <id> for <time>"
-        rid = int(m_id.group(1))
+        rid      = int(m_id.group(1))
         new_fire = time.time() + delay
-        con = sqlite3.connect(self._db)
-        affected = con.execute(
+        affected = self._db.execute(
             "UPDATE reminders SET fire_at=?, done=0 WHERE id=?",
             (new_fire, rid)
         ).rowcount
-        con.commit(); con.close()
         if not affected:
             return f"Reminder #{rid} not found."
-        when = time.strftime("%H:%M", time.localtime(new_fire))
-        return f"⏰ Reminder #{rid} snoozed to {when}."
+        return f"⏰ Reminder #{rid} snoozed to {time.strftime('%H:%M', time.localtime(new_fire))}."
 
     def _reschedule(self, text: str) -> str:
-        """Reschedule: 'reschedule reminder 2 to 5pm'"""
         m_id   = re.search(r"#?(\d+)", text)
         fire_at = _parse_at_time(text)
         delay   = _parse_delay(text) if not fire_at else None
         if not m_id or (not fire_at and not delay):
             return "Usage: reschedule reminder <id> to <time>"
-        rid     = int(m_id.group(1))
-        new_at  = fire_at or (time.time() + delay)
-        con = sqlite3.connect(self._db)
-        affected = con.execute(
+        rid    = int(m_id.group(1))
+        new_at = fire_at or (time.time() + delay)
+        affected = self._db.execute(
             "UPDATE reminders SET fire_at=?, done=0 WHERE id=?",
             (new_at, rid)
         ).rowcount
-        con.commit(); con.close()
         if not affected:
             return f"Reminder #{rid} not found."
-        when = time.strftime("%d %b %H:%M", time.localtime(new_at))
-        return f"⏰ Reminder #{rid} rescheduled to {when}."
+        return f"⏰ Reminder #{rid} rescheduled to {time.strftime('%d %b %H:%M', time.localtime(new_at))}."

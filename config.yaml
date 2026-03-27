@@ -1,67 +1,69 @@
 jarvis:
   name: Jarvis
-  version: 0.1.0
   debug: false
+
+  # LLM routing: true = LLM classifies every input (recommended)
+  #              false = keyword-fallback only (no LLM needed)
   llm_routing: true
+
+  llm_mode: lmstudio   # switch to 'openai' or 'anthropic' as needed
+
+  llm:
+    system_prompt: "You are Jarvis, a concise AI assistant. Answer briefly and clearly."
+
+  llm_backends:
+    lmstudio:
+      base_url: "http://localhost:1234/v1"
+      api_key: "lm-studio"
+      model: "local-model"
+    openai:
+      base_url: "https://api.openai.com/v1"
+      api_key: "sk-YOUR_OPENAI_KEY"
+      model: "gpt-4o-mini"
+    anthropic:
+      base_url: "https://api.anthropic.com/v1"
+      api_key: "YOUR_ANTHROPIC_KEY"
+      model: "claude-3-haiku-20240307"
+
   memory:
-    max_entries: 50
     persist: true
-    db_path: ~/.jarvis/memory.db
-  plugins_dir: plugins
+    db_path: "~/.jarvis/memory.db"
+    max_entries: 50
 
-  # --- GITHUB ---------------------------------------------
-  github:
-    token: ""        # or set JARVIS_GITHUB_TOKEN env var
-    user: shahil-sk  # default owner for short repo names
+  # -----------------------------------------------------------------------
+  # App Launcher
+  # -----------------------------------------------------------------------
+  # Map short names to real executables or paths.
+  # These override the built-in defaults in the launcher plugin.
+  app_aliases:
+    vscode: code
+    browser: google-chrome
+    term: gnome-terminal
+    editor: nvim
+    notes: obsidian
+    files: nautilus
+    calc: gnome-calculator
 
-  # --- WORKSPACES -----------------------------------------
+  # -----------------------------------------------------------------------
+  # Workspaces
+  # -----------------------------------------------------------------------
+  # Each workspace is a named list of apps / URLs / paths to open together.
+  # Say: "open my dev workspace" or "open workspace work"
   workspaces:
     dev:
       - code
-      - https://github.com/shahil-sk
-      - ~/projects
+      - https://github.com
+      - gnome-terminal
     work:
+      - chrome
       - https://mail.google.com
-      - https://calendar.google.com
-    monitor:
-      - https://github.com/shahil-sk/jarvis
+      - slack
+    media:
+      - spotify
+      - vlc
 
-  # --- LLM MODE -------------------------------------------
-  llm_mode: lmstudio
-
-  llm_backends:
-    openai:
-      base_url: https://api.openai.com/v1
-      api_key: ""
-      model: gpt-4o-mini
-      max_tokens: 512
-      temperature: 0.7
-    groq:
-      base_url: https://api.groq.com/openai/v1
-      api_key: ""
-      model: llama-3.3-70b-versatile
-      max_tokens: 512
-      temperature: 0.7
-    lmstudio:
-      base_url: http://localhost:1234/v1
-      api_key: lm-studio
-      model: local-model
-      max_tokens: 512
-      temperature: 0.7
-    ollama:
-      base_url: http://localhost:11434/v1
-      api_key: ollama
-      model: mistral
-      max_tokens: 512
-      temperature: 0.7
-    openrouter:
-      base_url: https://openrouter.ai/api/v1
-      api_key: ""
-      model: mistralai/mistral-7b-instruct
-      max_tokens: 512
-      temperature: 0.7
-
-  llm:
-    system_prompt: >
-      You are Jarvis, a fast and helpful AI assistant.
-      Be concise. Avoid filler. Answer directly.
+  # -----------------------------------------------------------------------
+  # GitHub plugin (optional)
+  # -----------------------------------------------------------------------
+  github:
+    token: ""   # set JARVIS_GITHUB_TOKEN env var instead of hardcoding

@@ -1,304 +1,187 @@
-"""Todo plugin — full task manager: add, list, complete, delete, edit, priority, tags, due dates."""
+"""Todo plugin v2 — migrated to core.db (WAL, migrations, no raw sqlite3).
 
-import sqlite3
-import os
-import re
+Status values: active | in_progress | blocked | done
+Priority    : 1=low  2=medium  3=high  4=urgent
+"""
+
 import time
+import re
 from plugins.base import PluginBase
-from core.config import get
+from core.db import DB
 
-_PRIORITIES = {"low": 1, "medium": 2, "med": 2, "high": 3, "urgent": 4, "critical": 4}
-_PRI_LABEL  = {1: "low", 2: "med", 3: "high", 4: "urgent"}
-_PRI_ICON   = {1: "○", 2: "◑", 3: "●", 4: "⚠️"}
-_STATUS_ICON = {"todo": "□", "doing": "▶", "done": "✓", "blocked": "⧗"}
+_STATUS  = ("active", "in_progress", "blocked", "done")
+_PRI_MAP = {1: "low", 2: "medium", 3: "high", 4: "urgent"}
 
-
-def _db_path() -> str:
-    raw = get("memory", {}).get("db_path", "~/.jarvis/memory.db")
-    return os.path.expanduser(raw)
-
-
-def _init_db(path: str):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    con = sqlite3.connect(path)
-    con.executescript("""
-        CREATE TABLE IF NOT EXISTS todos (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
-            title      TEXT    NOT NULL,
-            status     TEXT    DEFAULT 'todo',
-            priority   INTEGER DEFAULT 2,
-            tags       TEXT    DEFAULT '',
-            due        TEXT    DEFAULT '',
-            project    TEXT    DEFAULT '',
-            notes      TEXT    DEFAULT '',
-            created_at TEXT    DEFAULT (datetime('now','localtime')),
-            updated_at TEXT    DEFAULT (datetime('now','localtime'))
-        );
-    """)
-    con.commit()
-    con.close()
-
-
-# ── parsers ───────────────────────────────────────────────────
-
-def _extract_tags(text: str) -> tuple[str, list]:
-    tags = re.findall(r"#(\w+)", text)
-    clean = re.sub(r"#\w+", "", text).strip()
-    return clean, tags
-
-
-def _extract_priority(text: str) -> tuple[str, int]:
-    m = re.search(r"!!(urgent|critical)|!(high|medium|med|low)", text, re.I)
-    if m:
-        word  = (m.group(1) or m.group(2)).lower()
-        clean = text[:m.start()] + text[m.end():]
-        return clean.strip(), _PRIORITIES.get(word, 2)
-    # plain word priority
-    for word, val in _PRIORITIES.items():
-        pat = rf"\b{word}\s+priority\b|\bpriority\s+{word}\b"
-        if re.search(pat, text, re.I):
-            clean = re.sub(pat, "", text, flags=re.I).strip()
-            return clean, val
-    return text, 2
-
-
-def _extract_due(text: str) -> tuple[str, str]:
-    """Extract due date keywords: 'today', 'tomorrow', 'YYYY-MM-DD', 'Mon DD'."""
-    t = text.lower()
-    today = time.strftime("%Y-%m-%d")
-
-    if "today" in t:
-        clean = re.sub(r"\btoday\b", "", text, flags=re.I).strip()
-        return clean, today
-    if "tomorrow" in t:
-        due   = time.strftime("%Y-%m-%d", time.localtime(time.time() + 86400))
-        clean = re.sub(r"\btomorrow\b", "", text, flags=re.I).strip()
-        return clean, due
-    m = re.search(r"(\d{4}-\d{2}-\d{2})", text)
-    if m:
-        return text[:m.start()] + text[m.end():], m.group(1)
-    m = re.search(r"by\s+(\w+\s+\d{1,2})", text, re.I)
-    if m:
-        clean = text[:m.start()] + text[m.end():]
-        return clean.strip(), m.group(1)
-    return text, ""
-
-
-def _extract_project(text: str) -> tuple[str, str]:
-    m = re.search(r"@(\w+)", text)
-    if m:
-        return (text[:m.start()] + text[m.end():]).strip(), m.group(1)
-    return text, ""
-
-
-def _fmt_row(row) -> str:
-    rid, title, status, pri, tags, due, project, *_ = row
-    icon  = _STATUS_ICON.get(status, "□")
-    p_ico = _PRI_ICON.get(pri, "○")
-    parts = [f"{icon} #{rid:<3} {p_ico} {title}"]
-    if project : parts.append(f"@{project}")
-    if tags    : parts.append(" ".join(f"#{t}" for t in tags.split(",") if t))
-    if due     : parts.append(f"due:{due}")
-    return "  ".join(parts)
-
-
-# ── Plugin ─────────────────────────────────────────────────────
 
 class Plugin(PluginBase):
-    priority = 23  # just below scheduler
+    priority = 30
 
     def __init__(self):
-        self._db = _db_path()
-        _init_db(self._db)
+        self._db = DB()
+        self._db.migrate("todo_001_baseline", """
+            CREATE TABLE IF NOT EXISTS todos (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at REAL    NOT NULL,
+                updated_at REAL    NOT NULL,
+                title      TEXT    NOT NULL,
+                status     TEXT    DEFAULT 'active',
+                priority   INTEGER DEFAULT 2,
+                tags       TEXT    DEFAULT '',
+                due        TEXT    DEFAULT '',
+                project    TEXT    DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_todos_status  ON todos(status);
+            CREATE INDEX IF NOT EXISTS idx_todos_project ON todos(project);
+            CREATE INDEX IF NOT EXISTS idx_todos_due     ON todos(due);
+        """)
+
+    # ------------------------------------------------------------------ #
+    # matches / run  (keyword-fallback compatibility)
+    # ------------------------------------------------------------------ #
 
     def matches(self, text: str) -> bool:
-        return False  # fully intent-routed
+        return any(kw in text.lower() for kw in
+                   ("todo", "task", "add task", "list task", "due today"))
 
     def run(self, text: str, memory) -> str:
-        return "Todo plugin is intent-routed."
+        t = text.lower()
+        if "add todo"   in t or "add task" in t: return self._run_add(text)
+        if "list todo"  in t or "list task" in t: return self.list_todos()
+        if "todo stats" in t:                     return self.stats()
+        if "due today"  in t:                     return self.due_today()
+        m = re.search(r"#?(\d+)", text)
+        tid = int(m.group(1)) if m else 0
+        if "complete" in t or "done" in t: return self.complete(tid)
+        if "start"    in t:               return self.start(tid)
+        if "block"    in t:               return self.block(tid)
+        if "reopen"   in t:               return self.reopen(tid)
+        if "delete"   in t:               return self.delete(tid)
+        return "Unknown todo command."
 
-    # ── add ─────────────────────────────────────────────────────
+    # ------------------------------------------------------------------ #
+    # Public API — called by dispatcher
+    # ------------------------------------------------------------------ #
 
     def add(self, title: str, priority: int = 2, tags: str = "",
-            due: str = "", project: str = "", notes: str = "") -> str:
-        """Add with fully structured args (called by dispatcher)."""
+            due: str = "", project: str = "") -> str:
         if not title.strip():
-            return "Todo title cannot be empty."
-        con = sqlite3.connect(self._db)
-        cur = con.execute(
-            "INSERT INTO todos (title,status,priority,tags,due,project,notes) "
+            return "Please provide a title for the todo."
+        now = time.time()
+        tid = self._db.insert(
+            "INSERT INTO todos (created_at, updated_at, title, priority, tags, due, project) "
             "VALUES (?,?,?,?,?,?,?)",
-            (title.strip(), "todo", priority, tags, due, project, notes)
+            (now, now, title.strip(), max(1, min(4, int(priority))),
+             tags.strip(), due.strip(), project.strip())
         )
-        tid = cur.lastrowid
-        con.commit(); con.close()
-        p_lbl = _PRI_LABEL.get(priority, "med")
-        extras = "".join([
-            f" @{project}" if project else "",
-            f" #{tags}"    if tags    else "",
-            f" due:{due}"  if due     else "",
-        ])
-        return f"□ Todo #{tid} added [{p_lbl}]{extras}: {title}"
+        pri = _PRI_MAP.get(int(priority), "medium")
+        return f"✓ Todo #{tid} added [{pri}]: {title.strip()}"
 
-    def add_from_text(self, text: str) -> str:
-        """Parse raw natural language and add todo."""
-        # Strip leading verb
-        text = re.sub(r"^(add|create|new|todo|task)\s+(todo|task)?\s*:?\s*",
-                      "", text, flags=re.I).strip()
-        text, project  = _extract_project(text)
-        text, due      = _extract_due(text)
-        text, priority = _extract_priority(text)
-        text, tags     = _extract_tags(text)
-        return self.add(text, priority, ",".join(tags), due, project)
-
-    # ── list ─────────────────────────────────────────────────────
-
-    def list_todos(self, status: str = "", tag: str = "",
-                   project: str = "", priority: int = 0) -> str:
-        where, params = ["1=1"], []
-        if status   : where.append("status=?");             params.append(status)
-        else        : where.append("status != 'done'")
-        if tag      : where.append("tags LIKE ?");          params.append(f"%{tag}%")
-        if project  : where.append("project=?");            params.append(project)
-        if priority : where.append("priority>=?");          params.append(priority)
-
-        con  = sqlite3.connect(self._db)
-        rows = con.execute(
-            f"SELECT id,title,status,priority,tags,due,project,notes "
-            f"FROM todos WHERE {' AND '.join(where)} ORDER BY priority DESC, id",
-            params
-        ).fetchall()
-        con.close()
+    def list_todos(self, status: str = "", tag: str = "", project: str = "") -> str:
+        clauses, params = ["1"], []
+        if status and status in _STATUS:
+            clauses.append("status=?"); params.append(status)
+        elif not status:
+            clauses.append("status != 'done'")
+        if tag:
+            clauses.append("tags LIKE ?"); params.append(f"%{tag}%")
+        if project:
+            clauses.append("project=?"); params.append(project)
+        rows = self._db.fetchall(
+            f"SELECT id, title, status, priority, tags, due, project "
+            f"FROM todos WHERE {' AND '.join(clauses)} ORDER BY priority DESC, created_at ASC",
+            tuple(params)
+        )
         if not rows:
             return "No todos found."
-        # group by status
-        groups: dict[str, list] = {}
-        for row in rows:
-            s = row[2]
-            groups.setdefault(s, []).append(_fmt_row(row))
-        out = []
-        for s in ("doing", "todo", "blocked", "done"):
-            if s in groups:
-                label = {"todo":"To Do","doing":"In Progress","done":"Done","blocked":"Blocked"}[s]
-                out.append(f"\n{label}:")
-                out.extend(groups[s])
-        return "\n".join(out).strip()
+        lines = []
+        for r in rows:
+            pri  = _PRI_MAP.get(r["priority"], "?")
+            due  = f" due:{r['due']}"   if r.get("due")     else ""
+            proj = f" @{r['project']}" if r.get("project") else ""
+            tags = f" #{r['tags']}"    if r.get("tags")    else ""
+            lines.append(f"  #{r['id']:<3} [{r['status']:<11}] [{pri:<6}] {r['title']}{proj}{tags}{due}")
+        return f"Todos ({len(rows)}):\n" + "\n".join(lines)
 
-    # ── status transitions ─────────────────────────────────────────
+    def _change_status(self, tid: int, new_status: str) -> str:
+        if not tid:
+            return "Please provide a todo id."
+        affected = self._db.execute(
+            "UPDATE todos SET status=?, updated_at=? WHERE id=?",
+            (new_status, time.time(), tid)
+        ).rowcount
+        return f"Todo #{tid} → {new_status}." if affected else f"Todo #{tid} not found."
 
-    def complete(self, todo_id: int) -> str:
-        return self._set_status(todo_id, "done")
+    def complete(self, tid: int) -> str: return self._change_status(tid, "done")
+    def start(self,    tid: int) -> str: return self._change_status(tid, "in_progress")
+    def block(self,    tid: int) -> str: return self._change_status(tid, "blocked")
+    def reopen(self,   tid: int) -> str: return self._change_status(tid, "active")
 
-    def start(self, todo_id: int) -> str:
-        return self._set_status(todo_id, "doing")
-
-    def block(self, todo_id: int) -> str:
-        return self._set_status(todo_id, "blocked")
-
-    def reopen(self, todo_id: int) -> str:
-        return self._set_status(todo_id, "todo")
-
-    def _set_status(self, todo_id: int, status: str) -> str:
-        con = sqlite3.connect(self._db)
-        row = con.execute("SELECT title FROM todos WHERE id=?", (todo_id,)).fetchone()
-        if not row:
-            con.close()
-            return f"Todo #{todo_id} not found."
-        con.execute(
-            "UPDATE todos SET status=?, updated_at=datetime('now','localtime') WHERE id=?",
-            (status, todo_id)
-        )
-        con.commit(); con.close()
-        icon = _STATUS_ICON.get(status, "□")
-        return f"{icon} Todo #{todo_id} marked as {status}: {row[0]}"
-
-    # ── edit ──────────────────────────────────────────────────────
-
-    def edit(self, todo_id: int, title: str = "", priority: int = 0,
-             tags: str = "", due: str = "", project: str = "",
-             notes: str = "") -> str:
-        con = sqlite3.connect(self._db)
-        row = con.execute("SELECT * FROM todos WHERE id=?", (todo_id,)).fetchone()
-        if not row:
-            con.close()
-            return f"Todo #{todo_id} not found."
-        fields, params = [], []
-        if title   : fields.append("title=?");    params.append(title)
-        if priority: fields.append("priority=?"); params.append(priority)
-        if tags    : fields.append("tags=?");     params.append(tags)
-        if due     : fields.append("due=?");      params.append(due)
-        if project : fields.append("project=?");  params.append(project)
-        if notes   : fields.append("notes=?");    params.append(notes)
-        if not fields:
-            con.close()
-            return "Nothing to update."
-        fields.append("updated_at=datetime('now','localtime')")
-        params.append(todo_id)
-        con.execute(f"UPDATE todos SET {', '.join(fields)} WHERE id=?", params)
-        con.commit(); con.close()
-        return f"✏️ Todo #{todo_id} updated."
-
-    # ── delete ─────────────────────────────────────────────────────
-
-    def delete(self, todo_id: int) -> str:
-        con = sqlite3.connect(self._db)
-        row = con.execute("SELECT title FROM todos WHERE id=?", (todo_id,)).fetchone()
-        if not row:
-            con.close()
-            return f"Todo #{todo_id} not found."
-        con.execute("DELETE FROM todos WHERE id=?", (todo_id,))
-        con.commit(); con.close()
-        return f"🗑️ Todo #{todo_id} deleted: {row[0]}"
-
-    # ── search ────────────────────────────────────────────────────
+    def delete(self, tid: int) -> str:
+        if not tid:
+            return "Please provide a todo id."
+        affected = self._db.execute("DELETE FROM todos WHERE id=?", (tid,)).rowcount
+        return f"Todo #{tid} deleted." if affected else f"Todo #{tid} not found."
 
     def search(self, query: str) -> str:
-        con  = sqlite3.connect(self._db)
-        rows = con.execute(
-            "SELECT id,title,status,priority,tags,due,project,notes "
-            "FROM todos WHERE title LIKE ? OR tags LIKE ? OR notes LIKE ? OR project LIKE ?",
-            (f"%{query}%",) * 4
-        ).fetchall()
-        con.close()
+        rows = self._db.fetchall(
+            "SELECT id, title, status, priority FROM todos "
+            "WHERE title LIKE ? OR tags LIKE ? OR project LIKE ? "
+            "ORDER BY priority DESC",
+            (f"%{query}%", f"%{query}%", f"%{query}%")
+        )
         if not rows:
             return f"No todos matching '{query}'."
-        return "\n".join(_fmt_row(r) for r in rows)
-
-    # ── due today / overdue ───────────────────────────────────────
+        lines = [f"  #{r['id']:<3} [{r['status']:<11}] {r['title']}" for r in rows]
+        return f"Search results for '{query}':\n" + "\n".join(lines)
 
     def due_today(self) -> str:
         today = time.strftime("%Y-%m-%d")
-        con   = sqlite3.connect(self._db)
-        rows  = con.execute(
-            "SELECT id,title,status,priority,tags,due,project,notes "
-            "FROM todos WHERE due<=? AND status!='done' ORDER BY priority DESC",
+        rows  = self._db.fetchall(
+            "SELECT id, title, priority, project FROM todos "
+            "WHERE due<=? AND status!='done' ORDER BY priority DESC",
             (today,)
-        ).fetchall()
-        con.close()
+        )
         if not rows:
-            return "Nothing due today ✅"
-        return "Due today / overdue:\n" + "\n".join(_fmt_row(r) for r in rows)
-
-    # ── stats ──────────────────────────────────────────────────────
+            return "Nothing due today."
+        lines = [f"  #{r['id']:<3} [{_PRI_MAP.get(r['priority'],'?'):<6}] {r['title']}" for r in rows]
+        return f"Due today ({len(rows)}):\n" + "\n".join(lines)
 
     def stats(self) -> str:
-        con = sqlite3.connect(self._db)
-        rows = con.execute(
-            "SELECT status, COUNT(*) FROM todos GROUP BY status"
-        ).fetchall()
-        total = con.execute("SELECT COUNT(*) FROM todos").fetchone()[0]
-        overdue_count = con.execute(
-            "SELECT COUNT(*) FROM todos WHERE due!='' AND due<? AND status!='done'",
-            (time.strftime("%Y-%m-%d"),)
-        ).fetchone()[0]
-        con.close()
-        counts = {r[0]: r[1] for r in rows}
-        lines = [
-            f"Total     : {total}",
-            f"To Do     : {counts.get('todo', 0)}",
-            f"In Progress: {counts.get('doing', 0)}",
-            f"Done      : {counts.get('done', 0)}",
-            f"Blocked   : {counts.get('blocked', 0)}",
-            f"Overdue   : {overdue_count}",
-        ]
-        return "Todo Stats:\n" + "\n".join(lines)
+        total = self._db.fetchone("SELECT COUNT(*) as n FROM todos") or {"n": 0}
+        by_status = self._db.fetchall(
+            "SELECT status, COUNT(*) as n FROM todos GROUP BY status ORDER BY n DESC"
+        )
+        lines = [f"  Total: {total['n']}"]
+        for r in by_status:
+            lines.append(f"  {r['status']:<14} {r['n']}")
+        return "Todo stats:\n" + "\n".join(lines)
+
+    def edit(self, todo_id: int, title: str = "", priority: int = 0,
+             tags: str = "", due: str = "", project: str = "") -> str:
+        if not todo_id:
+            return "Please provide a todo id."
+        sets, params = [], []
+        if title:    sets.append("title=?");    params.append(title.strip())
+        if priority: sets.append("priority=?"); params.append(max(1, min(4, priority)))
+        if tags:     sets.append("tags=?");     params.append(tags.strip())
+        if due:      sets.append("due=?");      params.append(due.strip())
+        if project:  sets.append("project=?"); params.append(project.strip())
+        if not sets:
+            return "Nothing to update."
+        sets.append("updated_at=?"); params.append(time.time())
+        params.append(todo_id)
+        self._db.execute(
+            f"UPDATE todos SET {', '.join(sets)} WHERE id=?",
+            tuple(params)
+        )
+        return f"Todo #{todo_id} updated."
+
+    def _run_add(self, text: str) -> str:
+        """Keyword-fallback parser for raw 'add todo ...' text."""
+        title = re.sub(r"(add todo|add task)", "", text, flags=re.I).strip()
+        pri   = 2
+        if "!high"   in title or "high priority"   in title: pri = 3
+        if "!urgent" in title or "urgent"           in title: pri = 4
+        if "!low"    in title or "low priority"     in title: pri = 1
+        title = re.sub(r"!(?:high|low|urgent|medium)", "", title).strip()
+        return self.add(title, priority=pri)
