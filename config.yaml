@@ -1,7 +1,8 @@
 jarvis:
   name: Jarvis
   version: 0.1.0
-  debug: false
+  debug: false             # set true to see intent classification in terminal
+  llm_routing: true        # false = legacy keyword matching
   memory:
     max_entries: 50
     persist: true
@@ -9,8 +10,6 @@ jarvis:
   plugins_dir: plugins
 
   # --- WORKSPACES -----------------------------------------
-  # Each key is a workspace name. Items can be:
-  #   app names, file/folder paths, or https:// URLs
   workspaces:
     dev:
       - code
