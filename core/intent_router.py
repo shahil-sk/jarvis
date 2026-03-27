@@ -1,10 +1,37 @@
-"""Intent Router v2 — structured schema + few-shot examples + output validation."""
+"""Intent Router v3 — LLM-first pipeline.
+
+Flow
+----
+Every user input goes to the LLM first (no fast-rule shortcuts that silently
+skip intent classification). The LLM returns a structured JSON with:
+
+  {
+    "intent": "<namespace.action>",   # one of INTENT_SCHEMA keys
+    "args":   { ... },                # typed args for the plugin
+    "trigger": "<canonical phrase>"   # the exact phrase the plugin's
+                                       # matches() function will recognise
+                                       # (used when --no-llm-routing is on)
+  }
+
+The `trigger` field is the key addition: even in keyword-fallback mode the
+dispatcher now uses the LLM-normalised trigger instead of the raw user input,
+so plugins always receive something they can reliably match.
+
+Retry logic
+-----------
+- Attempt 1: strict JSON parse + schema validation.
+- Attempt 2: same, but we also ask the LLM to fix the bad JSON it returned.
+- Final fallback: {"intent": "llm.chat", "args": {}, "trigger": <text>}
+"""
 
 import json
 import urllib.request
 import urllib.error
 from core.config import get_llm_config
 
+# ---------------------------------------------------------------------------
+# Intent schema — single source of truth for every plugin intent + its args
+# ---------------------------------------------------------------------------
 INTENT_SCHEMA: dict[str, dict] = {
     # system
     "system.stats"   : {},
@@ -50,8 +77,8 @@ INTENT_SCHEMA: dict[str, dict] = {
     "clip.write"     : {"content": "str"},
     # notify
     "notify.send"    : {"message": "str"},
-    # scheduler v2
-    "scheduler.add"       : {"delay_seconds": "int?", "message": "str", "repeat": "str?", "fire_at": "float?"},
+    # scheduler
+    "scheduler.add"       : {"delay_seconds": "int?", "message": "str", "repeat": "str?"},
     "scheduler.add_at"    : {"time_str": "str", "message": "str", "repeat": "str?"},
     "scheduler.list"      : {},
     "scheduler.cancel"    : {"id": "int"},
@@ -70,12 +97,12 @@ INTENT_SCHEMA: dict[str, dict] = {
     "todo.due"      : {},
     "todo.stats"    : {},
     # notes
-    "notes.save"     : {"content": "str", "tag": "str?"},
-    "notes.list"     : {"tag": "str?"},
-    "notes.search"   : {"query": "str"},
-    "notes.delete"   : {"id": "int"},
-    "notes.history"  : {},
-    "notes.forget"   : {},
+    "notes.save"    : {"content": "str", "tag": "str?"},
+    "notes.list"    : {"tag": "str?"},
+    "notes.search"  : {"query": "str"},
+    "notes.delete"  : {"id": "int"},
+    "notes.history" : {},
+    "notes.forget"  : {},
     # launcher
     "launcher.workspace": {"name": "str"},
     "launcher.list"     : {},
@@ -89,8 +116,116 @@ INTENT_SCHEMA: dict[str, dict] = {
     "gh.list_commits"   : {"repo": "str", "branch": "str?", "limit": "int?"},
     "gh.list_branches"  : {"repo": "str"},
     "gh.search_repos"   : {"query": "str"},
-    # fallback
+    # brightness (new plugin)
+    "brightness.get"    : {},
+    "brightness.set"    : {"level": "int"},
+    "brightness.up"     : {},
+    "brightness.down"   : {},
+    # stopwatch (new plugin)
+    "stopwatch.start"   : {"name": "str?"},
+    "stopwatch.stop"    : {"name": "str?"},
+    "stopwatch.pause"   : {"name": "str?"},
+    "stopwatch.resume"  : {"name": "str?"},
+    "stopwatch.lap"     : {"name": "str?"},
+    "stopwatch.elapsed" : {"name": "str?"},
+    "stopwatch.list"    : {},
+    "stopwatch.reset"   : {"name": "str?"},
+    # env (new plugin)
+    "env.get"    : {"key": "str"},
+    "env.set"    : {"key": "str", "value": "str"},
+    "env.unset"  : {"key": "str"},
+    "env.list"   : {},
+    "env.search" : {"keyword": "str"},
+    # clipboard history (new plugin)
+    "clip_history.list"   : {"limit": "int?"},
+    "clip_history.search" : {"keyword": "str"},
+    "clip_history.recopy" : {"index": "int"},
+    "clip_history.clear"  : {},
+    # llm fallback
     "llm.chat"          : {},
+}
+
+# ---------------------------------------------------------------------------
+# Canonical trigger phrases
+# These are exactly what each plugin's matches() function recognises.
+# The LLM is instructed to pick from this map when building the trigger field.
+# ---------------------------------------------------------------------------
+TRIGGER_MAP: dict[str, str] = {
+    "system.stats"        : "system stats",
+    "system.uptime"       : "system uptime",
+    "system.sysinfo"      : "system info",
+    "system.shell"        : "run {cmd}",
+    "system.open"         : "open {target}",
+    "system.env"          : "env {key}",
+    "system.setenv"       : "set env {key}={value}",
+    "fs.find"             : "find {pattern}",
+    "fs.read"             : "read {path}",
+    "fs.list"             : "list {path}",
+    "fs.move"             : "move {src} to {dst}",
+    "fs.delete"           : "delete file {path}",
+    "fs.mkdir"            : "mkdir {path}",
+    "fs.pwd"              : "current directory",
+    "process.list"        : "list processes",
+    "process.kill"        : "kill {target}",
+    "process.find"        : "find process {name}",
+    "net.ping"            : "ping {host}",
+    "net.myip"            : "my public ip",
+    "net.localip"         : "my local ip",
+    "net.speedtest"       : "speed test",
+    "net.dns"             : "dns {host}",
+    "net.checkurl"        : "check url {url}",
+    "net.download"        : "download {url}",
+    "web.search"          : "search {query}",
+    "web.news"            : "news {topic}",
+    "web.summarize"       : "summarize {url}",
+    "clip.read"           : "read clipboard",
+    "clip.write"          : "copy to clipboard {content}",
+    "notify.send"         : "notify {message}",
+    "scheduler.add"       : "remind me in {delay_seconds} seconds {message}",
+    "scheduler.add_at"    : "remind me at {time_str} {message}",
+    "scheduler.list"      : "show reminders",
+    "scheduler.cancel"    : "cancel reminder {id}",
+    "todo.add"            : "add todo {title}",
+    "todo.list"           : "list todos",
+    "todo.complete"       : "complete todo {id}",
+    "todo.delete"         : "delete todo {id}",
+    "todo.search"         : "search todos {query}",
+    "todo.due"            : "todos due today",
+    "todo.stats"          : "todo stats",
+    "notes.save"          : "save note {content}",
+    "notes.list"          : "show notes",
+    "notes.search"        : "search note {query}",
+    "notes.delete"        : "delete note {id}",
+    "launcher.workspace"  : "open workspace {name}",
+    "launcher.list"       : "list workspaces",
+    "gh.list_repos"       : "list repos",
+    "gh.list_issues"      : "list issues {repo}",
+    "gh.create_issue"     : "create issue {repo} {title}",
+    "gh.list_prs"         : "list prs {repo}",
+    "gh.list_commits"     : "list commits {repo}",
+    "gh.search_repos"     : "search repos {query}",
+    "brightness.get"      : "what is brightness",
+    "brightness.set"      : "brightness set {level}",
+    "brightness.up"       : "brightness up",
+    "brightness.down"     : "brightness down",
+    "stopwatch.start"     : "start stopwatch {name}",
+    "stopwatch.stop"      : "stop stopwatch {name}",
+    "stopwatch.pause"     : "pause stopwatch {name}",
+    "stopwatch.resume"    : "resume stopwatch {name}",
+    "stopwatch.lap"       : "lap stopwatch {name}",
+    "stopwatch.elapsed"   : "elapsed stopwatch {name}",
+    "stopwatch.list"      : "list stopwatches",
+    "stopwatch.reset"     : "reset stopwatch {name}",
+    "env.get"             : "env {key}",
+    "env.set"             : "set env {key}={value}",
+    "env.unset"           : "unset env {key}",
+    "env.list"            : "list env",
+    "env.search"          : "search env {keyword}",
+    "clip_history.list"   : "clipboard history",
+    "clip_history.search" : "clipboard search {keyword}",
+    "clip_history.recopy" : "copy history item {index}",
+    "clip_history.clear"  : "clear clipboard history",
+    "llm.chat"            : "",
 }
 
 _REQUIRED: dict[str, list] = {
@@ -98,64 +233,81 @@ _REQUIRED: dict[str, list] = {
     for k, v in INTENT_SCHEMA.items()
 }
 
-_PRI_MAP = {"low": 1, "medium": 2, "med": 2, "high": 3, "urgent": 4, "critical": 4}
-
+# ---------------------------------------------------------------------------
+# Few-shot examples  (user text → JSON)
+# ---------------------------------------------------------------------------
 _EXAMPLES = [
-    # system
-    ("how much ram am i using",                         '{"intent":"system.stats","args":{}}'),
-    ("run git status",                                  '{"intent":"system.shell","args":{"cmd":"git status"}}'),
-    ("kill chrome",                                     '{"intent":"process.kill","args":{"target":"chrome"}}'),
-    ("is github down",                                  '{"intent":"net.checkurl","args":{"url":"https://github.com"}}'),
-    ("summarize https://news.ycombinator.com",          '{"intent":"web.summarize","args":{"url":"https://news.ycombinator.com","focus":""}}'),
-    ("latest news on AI",                               '{"intent":"web.news","args":{"topic":"AI"}}'),
-    # scheduler
-    ("remind me in 10 minutes to call John",            '{"intent":"scheduler.add","args":{"delay_seconds":600,"message":"call John","repeat":""}}'),
-    ("remind me to clean my godown drive in 2 hours",   '{"intent":"scheduler.add","args":{"delay_seconds":7200,"message":"clean godown drive","repeat":""}}'),
-    ("remind me at 3pm to review PR",                   '{"intent":"scheduler.add_at","args":{"time_str":"3pm","message":"review PR","repeat":""}}'),
-    ("remind me every day to drink water",              '{"intent":"scheduler.add","args":{"delay_seconds":86400,"message":"drink water","repeat":"daily"}}'),
-    ("snooze reminder 3 for 10 minutes",                '{"intent":"scheduler.snooze","args":{"id":3,"delay_seconds":600}}'),
-    ("reschedule reminder 2 to 5pm",                    '{"intent":"scheduler.reschedule","args":{"id":2,"time_str":"5pm"}}'),
-    ("show my reminders",                               '{"intent":"scheduler.list","args":{}}'),
-    ("cancel reminder 3",                               '{"intent":"scheduler.cancel","args":{"id":3}}'),
-    # todo
-    ("add todo fix the login bug",                      '{"intent":"todo.add","args":{"title":"fix the login bug","priority":"medium"}}'),
-    ("add task write tests for auth !high #backend @jarvis due tomorrow", '{"intent":"todo.add","args":{"title":"write tests for auth","priority":"high","tags":"backend","project":"jarvis","due":"tomorrow"}}'),
-    ("show my todos",                                   '{"intent":"todo.list","args":{}}'),
-    ("show all done todos",                             '{"intent":"todo.list","args":{"status":"done"}}'),
-    ("todos tagged backend",                            '{"intent":"todo.list","args":{"tag":"backend"}}'),
-    ("mark todo 4 as done",                             '{"intent":"todo.complete","args":{"id":4}}'),
-    ("start working on todo 2",                         '{"intent":"todo.start","args":{"id":2}}'),
-    ("todo 5 is blocked",                               '{"intent":"todo.block","args":{"id":5}}'),
-    ("delete todo 3",                                   '{"intent":"todo.delete","args":{"id":3}}'),
-    ("search todos for docker",                         '{"intent":"todo.search","args":{"query":"docker"}}'),
-    ("what's due today",                                '{"intent":"todo.due","args":{}}'),
-    ("todo stats",                                      '{"intent":"todo.stats","args":{}}'),
-    # notes / github / launcher
-    ("remember this: fix auth bug #work",               '{"intent":"notes.save","args":{"content":"fix auth bug","tag":"work"}}'),
-    ("open my dev workspace",                           '{"intent":"launcher.workspace","args":{"name":"dev"}}'),
-    ("show my repos",                                   '{"intent":"gh.list_repos","args":{}}'),
-    ("list open issues in jarvis",                      '{"intent":"gh.list_issues","args":{"repo":"jarvis","state":"open"}}'),
-    ("explain how docker works",                        '{"intent":"llm.chat","args":{}}'),
+    ("how much ram am i using",
+     '{"intent":"system.stats","args":{},"trigger":"system stats"}'),
+    ("run git status",
+     '{"intent":"system.shell","args":{"cmd":"git status"},"trigger":"run git status"}'),
+    ("kill chrome",
+     '{"intent":"process.kill","args":{"target":"chrome"},"trigger":"kill chrome"}'),
+    ("is github down",
+     '{"intent":"net.checkurl","args":{"url":"https://github.com"},"trigger":"check url https://github.com"}'),
+    ("latest news on AI",
+     '{"intent":"web.news","args":{"topic":"AI"},"trigger":"news AI"}'),
+    ("remind me in 10 minutes to call John",
+     '{"intent":"scheduler.add","args":{"delay_seconds":600,"message":"call John"},"trigger":"remind me in 600 seconds call John"}'),
+    ("remind me at 3pm to review PR",
+     '{"intent":"scheduler.add_at","args":{"time_str":"3pm","message":"review PR"},"trigger":"remind me at 3pm review PR"}'),
+    ("add todo fix the login bug high priority",
+     '{"intent":"todo.add","args":{"title":"fix the login bug","priority":"high"},"trigger":"add todo fix the login bug"}'),
+    ("show my todos",
+     '{"intent":"todo.list","args":{},"trigger":"list todos"}'),
+    ("mark todo 4 done",
+     '{"intent":"todo.complete","args":{"id":4},"trigger":"complete todo 4"}'),
+    ("save note buy milk #personal",
+     '{"intent":"notes.save","args":{"content":"buy milk","tag":"personal"},"trigger":"save note buy milk"}'),
+    ("open my dev workspace",
+     '{"intent":"launcher.workspace","args":{"name":"dev"},"trigger":"open workspace dev"}'),
+    ("show my repos",
+     '{"intent":"gh.list_repos","args":{},"trigger":"list repos"}'),
+    ("list open issues in jarvis",
+     '{"intent":"gh.list_issues","args":{"repo":"jarvis","state":"open"},"trigger":"list issues jarvis"}'),
+    ("can you turn the screen brightness up a little",
+     '{"intent":"brightness.up","args":{},"trigger":"brightness up"}'),
+    ("set brightness to 60 percent",
+     '{"intent":"brightness.set","args":{"level":60},"trigger":"brightness set 60"}'),
+    ("start timing the build",
+     '{"intent":"stopwatch.start","args":{"name":"build"},"trigger":"start stopwatch build"}'),
+    ("what is the value of PATH",
+     '{"intent":"env.get","args":{"key":"PATH"},"trigger":"env PATH"}'),
+    ("show clipboard history",
+     '{"intent":"clip_history.list","args":{},"trigger":"clipboard history"}'),
+    ("explain how docker works",
+     '{"intent":"llm.chat","args":{},"trigger":""}'),
 ]
 
 
+# ---------------------------------------------------------------------------
+# System prompt builder
+# ---------------------------------------------------------------------------
 def _build_system_prompt() -> str:
-    schema_lines = [f"  {k}: {json.dumps(v)}" for k, v in INTENT_SCHEMA.items()]
-    shot_lines   = [f'User: "{u}"\nOutput: {o}' for u, o in _EXAMPLES[-18:]]
+    schema_lines  = [f"  {k}: {json.dumps(v)}" for k, v in INTENT_SCHEMA.items()]
+    trigger_lines = [f"  {k}: \"{v}\"" for k, v in TRIGGER_MAP.items()]
+    shot_lines    = [f'User: "{u}"\nOutput: {o}' for u, o in _EXAMPLES]
     return (
-        "You are an intent classifier for an AI OS assistant called Jarvis.\n"
-        "Return ONLY a JSON object: {\"intent\": \"<id>\", \"args\": {...}}\n"
-        "No markdown. No explanation. One line.\n\n"
-        "Rules:\n"
-        "- Pick the single best intent from the schema.\n"
-        "- Time: convert to delay_seconds (min*60, hr*3600, day*86400).\n"
-        "- For 'at <time>' reminders use scheduler.add_at with time_str.\n"
-        "- Todo priority words: low=1, medium=2, high=3, urgent=4.\n"
-        "- Strip filler words from titles/messages.\n"
-        "- state defaults: issues=open, prs=open, todos=active.\n"
-        "- If nothing fits, use llm.chat.\n\n"
-        "Schema:\n" + "\n".join(schema_lines) + "\n\n"
-        "Examples:\n" + "\n\n".join(shot_lines)
+        "You are the input processor for Jarvis, a modular AI OS assistant.\n"
+        "Your ONLY job: convert the user's natural language into a structured JSON command.\n"
+        "\n"
+        "Return EXACTLY one JSON object on one line — no markdown, no explanation:\n"
+        '  {"intent": "<id>", "args": {...}, "trigger": "<canonical phrase>"}\n'
+        "\n"
+        "=== RULES ===\n"
+        "1. intent  — pick the single best match from the schema below.\n"
+        "2. args    — extract typed values from the user's words. Omit optional args if not mentioned.\n"
+        "3. trigger — the canonical phrase for this intent (see TRIGGER MAP below).\n"
+        "             Fill in {placeholders} from args. Use empty string for llm.chat.\n"
+        "4. Time    — convert to delay_seconds: minutes×60, hours×3600, days×86400.\n"
+        "5. Priority words: low=1, medium=2, high=3, urgent=4.\n"
+        "6. Strip filler words (please, can you, could you, I want to, etc.) from titles/messages.\n"
+        "7. If the user is asking a question or having a conversation with no clear OS action, use llm.chat.\n"
+        "8. NEVER return anything except the JSON object.\n"
+        "\n"
+        "=== INTENT SCHEMA ===\n" + "\n".join(schema_lines) + "\n\n"
+        "=== TRIGGER MAP ===\n" + "\n".join(trigger_lines) + "\n\n"
+        "=== EXAMPLES ===\n" + "\n\n".join(shot_lines)
     )
 
 
@@ -169,15 +321,24 @@ def _system_prompt() -> str:
     return _CACHED_PROMPT
 
 
-def _llm_call(user_text: str) -> str:
+def invalidate_prompt_cache() -> None:
+    """Call this after dynamically registering new intents."""
+    global _CACHED_PROMPT
+    _CACHED_PROMPT = None
+
+
+# ---------------------------------------------------------------------------
+# LLM call
+# ---------------------------------------------------------------------------
+def _llm_call(user_text: str, system_override: str | None = None) -> str:
     cfg = get_llm_config()
     payload = json.dumps({
         "model"      : cfg.get("model", ""),
         "messages"   : [
-            {"role": "system", "content": _system_prompt()},
+            {"role": "system", "content": system_override or _system_prompt()},
             {"role": "user",   "content": user_text},
         ],
-        "max_tokens" : 120,
+        "max_tokens" : 200,
         "temperature": 0.0,
     }).encode()
     req = urllib.request.Request(
@@ -185,53 +346,142 @@ def _llm_call(user_text: str) -> str:
         data=payload,
         headers={
             "Content-Type" : "application/json",
-            "Authorization": f"Bearer {cfg.get('api_key','')}",
+            "Authorization": f"Bearer {cfg.get('api_key', '')}",
         },
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=15) as r:
+    with urllib.request.urlopen(req, timeout=20) as r:
         data = json.loads(r.read())
     return data["choices"][0]["message"]["content"].strip()
 
 
+# ---------------------------------------------------------------------------
+# Parsing + validation
+# ---------------------------------------------------------------------------
 def _parse(raw: str) -> dict:
+    """Extract the first JSON object from LLM output (handles markdown fences)."""
     raw = raw.strip()
     if raw.startswith("```"):
         raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
     s, e = raw.find("{"), raw.rfind("}")
-    if s != -1 and e != -1:
-        raw = raw[s:e+1]
-    return json.loads(raw)
+    if s == -1 or e == -1:
+        raise json.JSONDecodeError("No JSON object found", raw, 0)
+    return json.loads(raw[s:e + 1])
 
 
-def _validate(result: dict) -> dict:
+def _coerce_args(intent: str, args: dict) -> dict:
+    """Coerce arg types per schema and return cleaned dict."""
+    schema = INTENT_SCHEMA.get(intent, {})
+    out = {}
+    for arg, typ in schema.items():
+        if arg not in args:
+            continue
+        base = typ.rstrip("?")
+        val  = args[arg]
+        try:
+            if base == "int":   val = int(val)
+            elif base == "float": val = float(val)
+            else:               val = str(val).strip()
+        except (ValueError, TypeError):
+            pass
+        out[arg] = val
+    # Pass through any extra args not in schema (forward-compat)
+    for k, v in args.items():
+        if k not in out:
+            out[k] = v
+    return out
+
+
+def _build_trigger(intent: str, args: dict) -> str:
+    """Fill TRIGGER_MAP template with actual arg values."""
+    template = TRIGGER_MAP.get(intent, "")
+    if not template:
+        return ""
+    try:
+        return template.format_map({k: v for k, v in args.items() if v is not None})
+    except KeyError:
+        return template  # leave unfilled placeholders as-is
+
+
+def _validate(result: dict, original_text: str) -> dict:
+    """Validate schema, coerce types, fill trigger, enforce required args."""
     intent = result.get("intent", "")
     args   = result.get("args", {})
+    if not isinstance(args, dict):
+        args = {}
+
     if intent not in INTENT_SCHEMA:
-        return {"intent": "llm.chat", "args": {}}
-    for arg, typ in INTENT_SCHEMA[intent].items():
-        base = typ.rstrip("?")
-        if arg in args:
-            if base == "int":
-                try: args[arg] = int(args[arg])
-                except: pass
-            elif base == "float":
-                try: args[arg] = float(args[arg])
-                except: pass
-    for arg in _REQUIRED.get(intent, []):
-        if arg not in args or args[arg] == "" or args[arg] is None:
-            return {"intent": "llm.chat", "args": {}, "_missing": arg}
-    return {"intent": intent, "args": args}
+        return {"intent": "llm.chat", "args": {}, "trigger": original_text}
+
+    args = _coerce_args(intent, args)
+
+    # Check required args
+    missing = [a for a in _REQUIRED.get(intent, []) if not args.get(a)]
+    if missing:
+        # Don't hard-fail — let llm.chat handle it so user gets a response
+        return {
+            "intent" : "llm.chat",
+            "args"   : {},
+            "trigger": original_text,
+            "_missing": missing,
+        }
+
+    # Prefer the LLM-returned trigger; fall back to building it from template
+    trigger = result.get("trigger") or _build_trigger(intent, args) or original_text
+
+    return {"intent": intent, "args": args, "trigger": trigger}
 
 
+# ---------------------------------------------------------------------------
+# Public classify() — always returns a valid dict
+# ---------------------------------------------------------------------------
 def classify(text: str) -> dict:
+    """
+    Send user text to LLM and return:
+      {"intent": str, "args": dict, "trigger": str}
+
+    Never raises — worst case returns llm.chat fallback.
+    """
+    last_raw = ""
     for attempt in range(2):
         try:
-            return _validate(_parse(_llm_call(text)))
+            raw = _llm_call(
+                text if attempt == 0
+                else f"Fix this invalid JSON and return only valid JSON: {last_raw}"
+            )
+            last_raw = raw
+            parsed   = _parse(raw)
+            result   = _validate(parsed, text)
+            # Log in debug mode
+            _debug_log(text, raw, result)
+            return result
+
         except json.JSONDecodeError:
             if attempt == 0:
-                continue
-            return {"intent": "llm.chat", "args": {}, "_error": "json_decode"}
-        except Exception as e:
-            return {"intent": "llm.chat", "args": {}, "_error": str(e)}
-    return {"intent": "llm.chat", "args": {}}
+                continue  # retry with fix prompt
+            break
+        except urllib.error.URLError as exc:
+            _debug_log(text, "", {"error": str(exc)})
+            return {"intent": "llm.chat", "args": {}, "trigger": text, "_error": f"LLM unreachable: {exc}"}
+        except Exception as exc:
+            _debug_log(text, "", {"error": str(exc)})
+            return {"intent": "llm.chat", "args": {}, "trigger": text, "_error": str(exc)}
+
+    return {"intent": "llm.chat", "args": {}, "trigger": text, "_error": "json_parse_failed"}
+
+
+def _debug_log(text: str, raw: str, result: dict) -> None:
+    """Print debug info when JARVIS_DEBUG=1."""
+    import os
+    if not os.environ.get("JARVIS_DEBUG"):
+        return
+    print(f"[router] input   : {text!r}")
+    if raw:
+        print(f"[router] llm_raw : {raw!r}")
+    print(f"[router] intent  : {result.get('intent')}")
+    print(f"[router] args    : {result.get('args')}")
+    print(f"[router] trigger : {result.get('trigger')!r}")
+    if "_missing" in result:
+        print(f"[router] missing : {result['_missing']}")
+    if "_error" in result:
+        print(f"[router] error   : {result['_error']}")
