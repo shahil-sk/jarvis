@@ -7,6 +7,8 @@ from plugins.base import PluginBase
 from core import intent_router
 from core.config import get
 
+_PRI_MAP = {"low": 1, "medium": 2, "med": 2, "high": 3, "urgent": 4, "critical": 4}
+
 
 class Dispatcher:
     def __init__(self):
@@ -64,7 +66,6 @@ class Dispatcher:
         if intent == "net.localip"   and "network" in p: return p["network"]._localip(text)
         if intent == "net.speedtest" and "network" in p: return p["network"]._speedtest(text)
 
-        # web plugin
         if "web" in p:
             wb = p["web"]
             if intent == "web.summarize": return wb.summarize(args.get("url",""), args.get("focus",""))
@@ -77,18 +78,77 @@ class Dispatcher:
 
         if intent == "clip.read"  and "clipboard" in p: return p["clipboard"]._read(text)
         if intent == "clip.write" and "clipboard" in p: return p["clipboard"]._write(f"copy to clipboard {args.get('content','')}")
+        if intent == "notify.send" and "notify" in p  : return p["notify"]._notify("Jarvis", args.get("message",""))
 
-        if intent == "notify.send" and "notify" in p:
-            return p["notify"]._notify("Jarvis", args.get("message", ""))
+        # scheduler v2
+        if "scheduler" in p:
+            sch = p["scheduler"]
+            if intent == "scheduler.add":
+                return sch.add_structured(
+                    delay_seconds=int(args.get("delay_seconds") or 60),
+                    message=args.get("message", "Reminder!"),
+                    repeat=args.get("repeat", ""),
+                )
+            if intent == "scheduler.add_at":
+                import re, time as _t
+                ts  = args.get("time_str", "")
+                # parse HH:MM am/pm from time_str
+                m   = re.search(r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", ts.lower())
+                fa  = 0.0
+                if m:
+                    hr  = int(m.group(1))
+                    mn  = int(m.group(2) or 0)
+                    mer = m.group(3) or ""
+                    if mer == "pm" and hr != 12: hr += 12
+                    elif mer == "am" and hr == 12: hr = 0
+                    now = _t.localtime()
+                    fa  = _t.mktime((now.tm_year, now.tm_mon, now.tm_mday,
+                                     hr, mn, 0, now.tm_wday, now.tm_yday, now.tm_isdst))
+                    if fa < _t.time(): fa += 86400
+                return sch.add_structured(
+                    delay_seconds=0,
+                    message=args.get("message", "Reminder!"),
+                    repeat=args.get("repeat", ""),
+                    fire_at=fa or (_t.time() + 60),
+                )
+            if intent == "scheduler.list"      : return sch._list()
+            if intent == "scheduler.cancel"    : return sch._cancel(f"cancel {args.get('id','')}")
+            if intent == "scheduler.snooze"    : return sch._snooze(f"snooze reminder {args.get('id','')} in {args.get('delay_seconds',300)} seconds")
+            if intent == "scheduler.reschedule": return sch._reschedule(f"reschedule reminder {args.get('id','')} at {args.get('time_str','')}")
 
-        if intent == "scheduler.add" and "scheduler" in p:
-            return p["scheduler"].add_structured(
-                delay_seconds=int(args.get("delay_seconds", 60)),
-                message=args.get("message", "Reminder!"),
-                repeat=args.get("repeat", ""),
-            )
-        if intent == "scheduler.list"   and "scheduler" in p: return p["scheduler"]._list()
-        if intent == "scheduler.cancel" and "scheduler" in p: return p["scheduler"]._cancel(f"cancel reminder {args.get('id','')}")
+        # todo
+        if "todo" in p:
+            td = p["todo"]
+            if intent == "todo.add":
+                pri_raw = args.get("priority", "medium")
+                pri     = _PRI_MAP.get(str(pri_raw).lower(), 2) if isinstance(pri_raw, str) else int(pri_raw)
+                return td.add(
+                    title   = args.get("title", ""),
+                    priority= pri,
+                    tags    = args.get("tags", ""),
+                    due     = args.get("due", ""),
+                    project = args.get("project", ""),
+                )
+            if intent == "todo.list"    : return td.list_todos(args.get("status",""), args.get("tag",""), args.get("project",""))
+            if intent == "todo.complete": return td.complete(int(args.get("id",0)))
+            if intent == "todo.start"   : return td.start(int(args.get("id",0)))
+            if intent == "todo.block"   : return td.block(int(args.get("id",0)))
+            if intent == "todo.reopen"  : return td.reopen(int(args.get("id",0)))
+            if intent == "todo.delete"  : return td.delete(int(args.get("id",0)))
+            if intent == "todo.search"  : return td.search(args.get("query",""))
+            if intent == "todo.due"     : return td.due_today()
+            if intent == "todo.stats"   : return td.stats()
+            if intent == "todo.edit":
+                pri_raw = args.get("priority", "")
+                pri     = _PRI_MAP.get(str(pri_raw).lower(), 0) if pri_raw else 0
+                return td.edit(
+                    todo_id = int(args.get("id", 0)),
+                    title   = args.get("title", ""),
+                    priority= pri,
+                    tags    = args.get("tags", ""),
+                    due     = args.get("due", ""),
+                    project = args.get("project", ""),
+                )
 
         if intent == "notes.save"    and "notes" in p: return p["notes"]._save(f"save note {args.get('content','')} #{args.get('tag','')}", memory)
         if intent == "notes.list"    and "notes" in p: return p["notes"]._list(f"show notes #{args.get('tag','')}", memory)
@@ -112,8 +172,7 @@ class Dispatcher:
             if intent == "gh.list_branches": return gh.list_branches(args.get("repo",""))
             if intent == "gh.search_repos" : return gh.search_repos(args.get("query",""))
 
-        if "llm" in p:
-            return p["llm"].run(text, memory)
+        if "llm" in p: return p["llm"].run(text, memory)
         return "No handler found."
 
     def dispatch(self, text: str, memory) -> str:
@@ -122,7 +181,6 @@ class Dispatcher:
                 if plugin.matches(text):
                     return plugin.run(text, memory)
             return "No plugin matched."
-
         result = intent_router.classify(text)
         intent = result.get("intent", "llm.chat")
         args   = result.get("args", {})
