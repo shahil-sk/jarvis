@@ -1,4 +1,4 @@
-"""Dispatcher — LLM-powered intent routing with plugin fallback."""
+"""Dispatcher — LLM intent routing → plugin method calls."""
 
 import importlib
 import pkgutil
@@ -23,8 +23,7 @@ class Dispatcher:
                 mod = importlib.import_module(f"plugins.{name}.plugin")
                 cls = getattr(mod, "Plugin", None)
                 if cls and issubclass(cls, PluginBase):
-                    inst = cls()
-                    loaded.append((name, inst))
+                    loaded.append((name, cls()))
             except Exception as e:
                 print(f"[dispatcher] failed to load '{name}': {e}")
         loaded.sort(key=lambda x: getattr(x[1], "priority", 100))
@@ -77,7 +76,7 @@ class Dispatcher:
         if intent == "notify.send" and "notify" in p:
             return p["notify"]._notify("Jarvis", args.get("message", ""))
 
-        # scheduler — delegate cleanly to plugin methods
+        # scheduler
         if intent == "scheduler.add" and "scheduler" in p:
             return p["scheduler"].add_structured(
                 delay_seconds=int(args.get("delay_seconds", 60)),
@@ -98,6 +97,19 @@ class Dispatcher:
         # launcher
         if intent == "launcher.workspace" and "launcher" in p: return p["launcher"]._launch_workspace(args.get("name", ""))
         if intent == "launcher.list"      and "launcher" in p: return p["launcher"]._list_workspaces(text)
+
+        # github
+        if "github" in p:
+            gh = p["github"]
+            if intent == "gh.list_repos"   : return gh.list_repos(int(args.get("limit", 10)))
+            if intent == "gh.get_repo"     : return gh.get_repo(args.get("repo", ""))
+            if intent == "gh.list_issues"  : return gh.list_issues(args.get("repo", ""), args.get("state", "open"))
+            if intent == "gh.create_issue" : return gh.create_issue(args.get("repo", ""), args.get("title", ""), args.get("body", ""))
+            if intent == "gh.close_issue"  : return gh.close_issue(args.get("repo", ""), int(args.get("number", 0)))
+            if intent == "gh.list_prs"     : return gh.list_prs(args.get("repo", ""), args.get("state", "open"))
+            if intent == "gh.list_commits" : return gh.list_commits(args.get("repo", ""), args.get("branch", ""), int(args.get("limit", 10)))
+            if intent == "gh.list_branches": return gh.list_branches(args.get("repo", ""))
+            if intent == "gh.search_repos" : return gh.search_repos(args.get("query", ""))
 
         # fallback
         if "llm" in p:

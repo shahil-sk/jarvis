@@ -1,13 +1,18 @@
 jarvis:
   name: Jarvis
   version: 0.1.0
-  debug: false             # set true to see intent classification in terminal
-  llm_routing: true        # false = legacy keyword matching
+  debug: false
+  llm_routing: true
   memory:
     max_entries: 50
     persist: true
     db_path: ~/.jarvis/memory.db
   plugins_dir: plugins
+
+  # --- GITHUB ---------------------------------------------
+  github:
+    token: ""        # or set JARVIS_GITHUB_TOKEN env var
+    user: shahil-sk  # default owner for short repo names
 
   # --- WORKSPACES -----------------------------------------
   workspaces:
@@ -15,11 +20,9 @@ jarvis:
       - code
       - https://github.com/shahil-sk
       - ~/projects
-
     work:
       - https://mail.google.com
       - https://calendar.google.com
-
     monitor:
       - https://github.com/shahil-sk/jarvis
 
@@ -33,28 +36,24 @@ jarvis:
       model: gpt-4o-mini
       max_tokens: 512
       temperature: 0.7
-
     groq:
       base_url: https://api.groq.com/openai/v1
       api_key: ""
       model: llama-3.3-70b-versatile
       max_tokens: 512
       temperature: 0.7
-
     lmstudio:
       base_url: http://localhost:1234/v1
       api_key: lm-studio
       model: local-model
       max_tokens: 512
       temperature: 0.7
-
     ollama:
       base_url: http://localhost:11434/v1
       api_key: ollama
       model: mistral
       max_tokens: 512
       temperature: 0.7
-
     openrouter:
       base_url: https://openrouter.ai/api/v1
       api_key: ""
