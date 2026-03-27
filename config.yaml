@@ -1,0 +1,7 @@
+jarvis:
+  name: Jarvis
+  version: 0.1.0
+  debug: false
+  memory:
+    max_entries: 50
+  plugins_dir: plugins
