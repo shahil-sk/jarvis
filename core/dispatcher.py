@@ -2,9 +2,9 @@
 
 Dispatch flow
 -------------
-1. intent_router.classify(text)  → {intent, args, trigger}
-2. If intent is recognised in _route() → call the right plugin method with typed args.
-3. If intent == "llm.chat"        → pass original text to llm plugin.
+1. intent_router.classify(text)  -> {intent, args, trigger}
+2. If intent is recognised in _route() -> call the right plugin method with typed args.
+3. If intent == "llm.chat"        -> pass original text to llm plugin.
 4. Keyword-fallback mode (--no-llm-routing):
      - Still calls classify() to get a normalised trigger.
      - Passes trigger (not raw user text) to plugin.matches() / plugin.run().
@@ -37,7 +37,7 @@ def _validate_plugin(name: str, instance: PluginBase) -> list[str]:
     if not callable(getattr(instance, "run", None)):
         warnings.append("missing callable 'run(text, memory)'")
     if not isinstance(getattr(instance, "priority", None), int):
-        warnings.append("'priority' is not an int — defaulting to 100")
+        warnings.append("'priority' is not an int -- defaulting to 100")
         instance.priority = 100
     return warnings
 
@@ -62,25 +62,25 @@ class Dispatcher:
                 mod = importlib.import_module(f"plugins.{name}.plugin")
             except Exception as exc:
                 self._failed_plugins[name] = f"import error: {exc}"
-                print(f"[dispatcher] ✗ '{name}' failed to import: {exc}")
+                print(f"[dispatcher] x '{name}' failed to import: {exc}")
                 continue
             cls = getattr(mod, "Plugin", None)
             if cls is None:
                 self._failed_plugins[name] = "no class named 'Plugin' in plugin.py"
-                print(f"[dispatcher] ✗ '{name}': no Plugin class")
+                print(f"[dispatcher] x '{name}': no Plugin class")
                 continue
             if not (isinstance(cls, type) and issubclass(cls, PluginBase)):
                 self._failed_plugins[name] = "Plugin does not subclass PluginBase"
-                print(f"[dispatcher] ✗ '{name}': not a PluginBase subclass")
+                print(f"[dispatcher] x '{name}': not a PluginBase subclass")
                 continue
             try:
                 instance = cls()
             except Exception as exc:
                 self._failed_plugins[name] = f"__init__ raised: {exc}"
-                print(f"[dispatcher] ✗ '{name}' failed to instantiate: {exc}")
+                print(f"[dispatcher] x '{name}' failed to instantiate: {exc}")
                 continue
             for w in _validate_plugin(name, instance):
-                print(f"[dispatcher] ⚠ '{name}': {w}")
+                print(f"[dispatcher] ! '{name}': {w}")
             loaded.append((name, instance))
 
         loaded.sort(key=lambda x: getattr(x[1], "priority", 100))
@@ -99,7 +99,7 @@ class Dispatcher:
         self._plugins.clear()
         self._failed_plugins.clear()
         self._load_plugins()
-        return f"Plugins reloaded — {len(self._plugins)} loaded, {len(self._failed_plugins)} failed."
+        return f"Plugins reloaded -- {len(self._plugins)} loaded, {len(self._failed_plugins)} failed."
 
     # ------------------------------------------------------------------ #
     # Safe call wrapper
@@ -116,14 +116,14 @@ class Dispatcher:
             result = fn(*args, **kwargs)
             return result if isinstance(result, str) else str(result)
         except Exception as exc:
-            print(f"[dispatcher] ✗ {plugin_name}.{method} raised:\n{traceback.format_exc()}")
+            print(f"[dispatcher] x {plugin_name}.{method} raised:\n{traceback.format_exc()}")
             return f"[{plugin_name}] error: {exc}"
 
     def _run(self, plugin_name: str, text: str, memory) -> str:
         return self._call(plugin_name, "run", text, memory)
 
     # ------------------------------------------------------------------ #
-    # Intent → plugin routing
+    # Intent -> plugin routing
     # ------------------------------------------------------------------ #
 
     def _route(self, intent: str, args: dict, text: str, trigger: str, memory) -> str:  # noqa: C901
@@ -248,32 +248,34 @@ class Dispatcher:
             if intent == "gh.list_commits" : return self._call("github", "list_commits", args.get("repo",""), args.get("branch",""), int(args.get("limit",10)))
             if intent == "gh.list_branches": return self._call("github", "list_branches", args.get("repo",""))
             if intent == "gh.search_repos" : return self._call("github", "search_repos", args.get("query",""))
-        # brightness (new plugin — routed via trigger)
+        # brightness
         if intent in ("brightness.get", "brightness.set", "brightness.up", "brightness.down") and "brightness" in p:
             return self._run("brightness", trigger, memory)
-        # stopwatch (new plugin — routed via trigger)
+        # stopwatch
         if intent.startswith("stopwatch.") and "stopwatch" in p:
             return self._run("stopwatch", trigger, memory)
-        # env (new plugin — routed via trigger)
+        # env
         if intent.startswith("env.") and "env" in p:
             return self._run("env", trigger, memory)
-        # clipboard history (new plugin — routed via trigger)
+        # clipboard history
         if intent.startswith("clip_history.") and "clipboard_history" in p:
             return self._run("clipboard_history", trigger, memory)
+        # nmap
+        if intent.startswith("nmap.") and "nmap" in p:
+            return self._call("nmap", "run_intent", intent, args.get("target", ""))
         # LLM fallback
         if "llm" in p:
             return self._run("llm", text, memory)
         return "I don't know how to handle that yet."
 
     # ------------------------------------------------------------------ #
-    # Public dispatch — always returns str
+    # Public dispatch -- always returns str
     # ------------------------------------------------------------------ #
 
     def dispatch(self, text: str, memory) -> str:
         if not text or not text.strip():
             return ""
         try:
-            # ── Step 1: LLM classifies and normalises the input ──────────
             try:
                 result  = intent_router.classify(text)
             except Exception as exc:
@@ -287,7 +289,6 @@ class Dispatcher:
             if get("debug", False):
                 print(f"[router] intent={intent}  args={args}  trigger={trigger!r}")
 
-            # ── Step 2: keyword-fallback mode uses normalised trigger ────
             if not self._use_llm_routing:
                 for _, plugin in self._plugins.items():
                     try:
@@ -299,7 +300,6 @@ class Dispatcher:
                         continue
                 return "No plugin matched."
 
-            # ── Step 3: route by intent ──────────────────────────────────
             return self._route(intent, args, text, trigger, memory)
 
         except Exception as exc:
