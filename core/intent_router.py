@@ -1,7 +1,6 @@
 """Intent Router v2 — structured schema + few-shot examples + output validation."""
 
 import json
-import os
 import urllib.request
 import urllib.error
 from core.config import get_llm_config
@@ -27,7 +26,7 @@ INTENT_SCHEMA: dict[str, dict] = {
     "process.list"   : {},
     "process.kill"   : {"target": "str"},
     "process.find"   : {"name": "str"},
-    # network
+    # network (infra)
     "net.ping"       : {"host": "str"},
     "net.curl"       : {"url": "str"},
     "net.download"   : {"url": "str"},
@@ -38,6 +37,14 @@ INTENT_SCHEMA: dict[str, dict] = {
     "net.checkurl"   : {"url": "str"},
     "net.localip"    : {},
     "net.speedtest"  : {},
+    # web (content-aware)
+    "web.summarize"  : {"url": "str", "focus": "str?"},
+    "web.read"       : {"url": "str"},
+    "web.ask"        : {"url": "str", "question": "str"},
+    "web.extract"    : {"url": "str", "what": "str"},
+    "web.compare"    : {"url1": "str", "url2": "str", "aspect": "str?"},
+    "web.search"     : {"query": "str"},
+    "web.news"       : {"topic": "str"},
     # clipboard
     "clip.read"      : {},
     "clip.write"     : {"content": "str"},
@@ -68,7 +75,7 @@ INTENT_SCHEMA: dict[str, dict] = {
     "gh.list_branches"  : {"repo": "str"},
     "gh.search_repos"   : {"query": "str"},
     # fallback
-    "llm.chat"       : {},
+    "llm.chat"          : {},
 }
 
 _REQUIRED: dict[str, list] = {
@@ -79,42 +86,40 @@ _REQUIRED: dict[str, list] = {
 _EXAMPLES = [
     ("how much ram am i using",                        '{"intent":"system.stats","args":{}}'),
     ("run git status",                                 '{"intent":"system.shell","args":{"cmd":"git status"}}'),
-    ("open vscode",                                    '{"intent":"system.open","args":{"target":"code"}}'),
-    ("show me what's in ~/downloads",                  '{"intent":"fs.list","args":{"path":"~/downloads"}}'),
+    ("show me what\'s in ~/downloads",                 '{"intent":"fs.list","args":{"path":"~/downloads"}}'),
     ("find all python files",                          '{"intent":"fs.find","args":{"pattern":"*.py"}}'),
-    ("rename old.txt to new.txt",                      '{"intent":"fs.move","args":{"src":"old.txt","dst":"new.txt"}}'),
-    ("what processes are eating my cpu",               '{"intent":"process.list","args":{}}'),
     ("kill chrome",                                    '{"intent":"process.kill","args":{"target":"chrome"}}'),
-    ("is nginx running",                               '{"intent":"process.find","args":{"name":"nginx"}}'),
     ("ping google.com",                                '{"intent":"net.ping","args":{"host":"google.com"}}'),
     ("is github down",                                 '{"intent":"net.checkurl","args":{"url":"https://github.com"}}'),
-    ("what's my public ip",                            '{"intent":"net.myip","args":{}}'),
     ("check my internet speed",                        '{"intent":"net.speedtest","args":{}}'),
-    ("what's in my clipboard",                         '{"intent":"clip.read","args":{}}'),
+    # web examples
+    ("summarize https://news.ycombinator.com",         '{"intent":"web.summarize","args":{"url":"https://news.ycombinator.com","focus":""}}'),
+    ("summarize github.com/trending focus on python",  '{"intent":"web.summarize","args":{"url":"https://github.com/trending","focus":"python"}}'),
+    ("read https://example.com",                       '{"intent":"web.read","args":{"url":"https://example.com"}}'),
+    ("what does vercel.com say about pricing",         '{"intent":"web.ask","args":{"url":"https://vercel.com","question":"what are the pricing plans"}}'),
+    ("extract emails from https://company.com/contact",'{"intent":"web.extract","args":{"url":"https://company.com/contact","what":"emails"}}'),
+    ("get all links from https://docs.python.org",     '{"intent":"web.extract","args":{"url":"https://docs.python.org","what":"links"}}'),
+    ("compare vercel.com and netlify.com on pricing",  '{"intent":"web.compare","args":{"url1":"https://vercel.com/pricing","url2":"https://netlify.com/pricing","aspect":"pricing"}}'),
+    ("search the web for fast python sqlite orm",      '{"intent":"web.search","args":{"query":"fast python sqlite orm"}}'),
+    ("latest news on AI",                              '{"intent":"web.news","args":{"topic":"AI"}}'),
+    ("what\'s happening in tech today",                '{"intent":"web.news","args":{"topic":"technology"}}'),
+    # scheduler
     ("remind me in 10 minutes to call John",           '{"intent":"scheduler.add","args":{"delay_seconds":600,"message":"call John","repeat":""}}'),
     ("remind me to clean my godown drive in 2 hours",  '{"intent":"scheduler.add","args":{"delay_seconds":7200,"message":"clean godown drive","repeat":""}}'),
-    ("remind me every day to drink water",             '{"intent":"scheduler.add","args":{"delay_seconds":86400,"message":"drink water","repeat":"daily"}}'),
     ("show my reminders",                              '{"intent":"scheduler.list","args":{}}'),
-    ("remember this: fix the auth bug #work",          '{"intent":"notes.save","args":{"content":"fix the auth bug","tag":"work"}}'),
+    ("remember this: fix auth bug #work",              '{"intent":"notes.save","args":{"content":"fix auth bug","tag":"work"}}'),
     ("search notes for docker",                        '{"intent":"notes.search","args":{"query":"docker"}}'),
     ("open my dev workspace",                          '{"intent":"launcher.workspace","args":{"name":"dev"}}'),
-    # github examples
     ("show my repos",                                  '{"intent":"gh.list_repos","args":{}}'),
-    ("show repo jarvis",                               '{"intent":"gh.get_repo","args":{"repo":"jarvis"}}'),
     ("list open issues in jarvis",                     '{"intent":"gh.list_issues","args":{"repo":"jarvis","state":"open"}}'),
-    ("create issue in jarvis: login page crashes",     '{"intent":"gh.create_issue","args":{"repo":"jarvis","title":"login page crashes","body":""}}'),
-    ("close issue 5 in jarvis",                        '{"intent":"gh.close_issue","args":{"repo":"jarvis","number":5}}'),
-    ("show open PRs in jarvis",                        '{"intent":"gh.list_prs","args":{"repo":"jarvis","state":"open"}}'),
     ("latest commits on jarvis",                       '{"intent":"gh.list_commits","args":{"repo":"jarvis","branch":"","limit":10}}'),
-    ("branches in jarvis",                             '{"intent":"gh.list_branches","args":{"repo":"jarvis"}}'),
-    ("search github for fast python sqlite orm",       '{"intent":"gh.search_repos","args":{"query":"fast python sqlite orm"}}'),
     ("explain how docker networking works",            '{"intent":"llm.chat","args":{}}'),
 ]
 
 
 def _build_system_prompt() -> str:
     schema_lines = [f"  {k}: {json.dumps(v)}" for k, v in INTENT_SCHEMA.items()]
-    shot_lines   = [f'User: "{u}"\nOutput: {o}' for u, o in _EXAMPLES[-14:]]
+    shot_lines   = [f'User: "{u}"\nOutput: {o}' for u, o in _EXAMPLES[-16:]]
     return (
         "You are an intent classifier for an AI OS assistant called Jarvis.\n"
         "Return ONLY a JSON object: {\"intent\": \"<id>\", \"args\": {...}}\n"
@@ -124,6 +129,8 @@ def _build_system_prompt() -> str:
         "- Extract ALL required args precisely from the user message.\n"
         "- Time: convert to delay_seconds (min*60, hr*3600, day*86400).\n"
         "- Strip filler (remind me to / please / can you).\n"
+        "- web.summarize vs net.checkurl: summarize=content, checkurl=uptime only.\n"
+        "- web.ask: URL + question both required.\n"
         "- state defaults: issues=open, prs=open.\n"
         "- If nothing fits, use llm.chat.\n\n"
         "Schema:\n" + "\n".join(schema_lines) + "\n\n"
