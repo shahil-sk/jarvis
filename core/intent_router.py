@@ -21,7 +21,7 @@ import urllib.error
 from core.config import get_llm_config
 
 # ---------------------------------------------------------------------------
-# Core built-in intents that have no dedicated plugin file
+# Core built-in intents
 # ---------------------------------------------------------------------------
 _BUILTIN_SCHEMA: dict[str, dict] = {
     "system.stats"        : {},
@@ -249,11 +249,80 @@ _DYNAMIC_EXAMPLES: list[tuple] = []
 
 
 # ---------------------------------------------------------------------------
-# Keyword pre-classifier
-# Catches the most common commands before the LLM is called.
-# Each rule is (regex_pattern, intent, args_fn).
-# args_fn receives the re.Match object and returns a dict.
-# Rules are evaluated top-to-bottom; first match wins.
+# Nmap keyword classifier
+# Uses substring search so "do a vuln scan on X" or "do a vlun scan on X"
+# are both caught. Typo tolerance is handled by fuzzy keyword lists.
+# ---------------------------------------------------------------------------
+
+# Keywords that signal this is an nmap command at all
+_NMAP_TRIGGER_WORDS = [
+    "scan", "nmap", "port scan", "portscan", "enumerate", "check ports",
+    "vlun", "vuln", "vulnerability",  # include common typos
+]
+
+# Ordered mode-detection rules: (keywords_anywhere_in_text, intent)
+# Checked top-to-bottom; first match wins.
+_NMAP_MODE_KEYWORDS: list[tuple[list[str], str]] = [
+    (["vuln", "vulnerability", "cve", "vlun", "vln"],  "nmap.scan_vuln"),
+    (["silent", "stealth", "quiet"],                    "nmap.scan_silent"),
+    (["full", "all ports", "complete", "deep"],         "nmap.scan_full"),
+    (["version", "service", "banner"],                  "nmap.scan_version"),
+    (["os", "operating system"],                        "nmap.scan_os"),
+    (["quick", "fast", "rapid"],                        "nmap.scan_quick"),
+]
+
+
+def _nmap_extract_target(text: str) -> str:
+    """Extract IP address or domain from free-form text."""
+    # Match IP first
+    ip = re.search(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b", text)
+    if ip:
+        return ip.group(1)
+    # Match domain (e.g. eyeqdotnet.com, www.example.org)
+    domain = re.search(
+        r"\b([a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?"
+        r"(?:\.[a-zA-Z]{2,})+)\b", text
+    )
+    if domain:
+        return domain.group(1)
+    # Fallback: grab word after scan/nmap/on keywords
+    m = re.search(r"(?:scan|nmap|on|for)\s+(\S+)", text, re.IGNORECASE)
+    if m:
+        word = m.group(1).strip(".,;:")
+        if word not in {"ports", "the", "my", "all", "a", "an"}:
+            return word
+    return ""
+
+
+def _nmap_classify(text: str) -> dict | None:
+    """
+    Check if text is an nmap command using substring keyword search.
+    Returns a classified dict or None if not an nmap command.
+    """
+    t = text.lower()
+    if not any(kw in t for kw in _NMAP_TRIGGER_WORDS):
+        return None
+
+    target = _nmap_extract_target(text)
+    if not target:
+        return None
+
+    # Detect scan mode
+    intent = "nmap.scan_normal"
+    for keywords, mode in _NMAP_MODE_KEYWORDS:
+        if any(kw in t for kw in keywords):
+            intent = mode
+            break
+
+    trigger = TRIGGER_MAP.get(intent, "nmap scan {target}").format(target=target)
+    return {"intent": intent, "args": {"target": target}, "trigger": trigger, "_source": "keyword"}
+
+
+# ---------------------------------------------------------------------------
+# Keyword pre-classifier (non-nmap rules)
+# Each rule: (regex_pattern, intent, args_fn)
+# args_fn receives re.Match and returns a dict.
+# Rules use ^ anchors — for sentence-style inputs use _nmap_classify above.
 # ---------------------------------------------------------------------------
 
 def _url_from(m: re.Match, group: int = 1) -> str:
@@ -268,6 +337,8 @@ _PRE_RULES: list[tuple] = [
     (r"^(list|show|display)\s+(all\s+)?processes?$",
      "process.list", lambda m: {}),
     (r"^(list|show|display)\s+(all\s+)?running\s+processes?$",
+     "process.list", lambda m: {}),
+    (r"^process\s*$",
      "process.list", lambda m: {}),
     (r"^(top|top\s+(\d+))\s+processes?",
      "process.top", lambda m: {"limit": int(m.group(2)) if m.group(2) else 10}),
@@ -324,22 +395,6 @@ _PRE_RULES: list[tuple] = [
     (r"^curl\s+(.+)$",
      "net.curl", lambda m: {"url": _url_from(m, 1)}),
 
-    # --- nmap ---
-    (r"^(nmap\s+)?(scan|nmap)\s+(--vuln|-sV|--full|-sn)?\s*(.+)$",
-     "nmap.scan_normal", lambda m: {"target": m.group(4).strip()}),
-    (r"^(full|deep)\s+scan\s+(.+)$",
-     "nmap.scan_full", lambda m: {"target": m.group(2).strip()}),
-    (r"^(vuln|vulnerability)\s+scan\s+(.+)$",
-     "nmap.scan_vuln", lambda m: {"target": m.group(2).strip()}),
-    (r"^(os|os\s+detect(?:ion)?)\s+scan\s+(.+)$",
-     "nmap.scan_os", lambda m: {"target": m.group(2).strip()}),
-    (r"^(version|service)\s+scan\s+(.+)$",
-     "nmap.scan_version", lambda m: {"target": m.group(2).strip()}),
-    (r"^(silent|stealth|quiet)\s+scan\s+(.+)$",
-     "nmap.scan_silent", lambda m: {"target": m.group(2).strip()}),
-    (r"^(quick)\s+scan\s+(.+)$",
-     "nmap.scan_quick", lambda m: {"target": m.group(2).strip()}),
-
     # --- system ---
     (r"^(system\s+)?(stats?|status|usage)$",
      "system.stats", lambda m: {}),
@@ -357,7 +412,6 @@ _PRE_RULES: list[tuple] = [
      "system.open", lambda m: {"target": m.group(2).strip()}),
 ]
 
-# Compile all patterns once at import time
 _PRE_RULES_COMPILED = [
     (re.compile(pattern, re.IGNORECASE), intent, args_fn)
     for pattern, intent, args_fn in _PRE_RULES
@@ -367,8 +421,14 @@ _PRE_RULES_COMPILED = [
 def _keyword_classify(text: str) -> dict | None:
     """
     Try to match user input against keyword rules.
+    Nmap is handled separately via _nmap_classify.
     Returns a classified dict if matched, None otherwise.
     """
+    # Nmap gets its own keyword-search classifier (not anchor-based)
+    nmap_result = _nmap_classify(text)
+    if nmap_result:
+        return nmap_result
+
     stripped = text.strip()
     for pattern, intent, args_fn in _PRE_RULES_COMPILED:
         m = pattern.match(stripped)
@@ -426,6 +486,8 @@ _BUILTIN_EXAMPLES = [
      '{"intent":"todo.list","args":{},"trigger":"list todos"}'),
     ("list all running processes",
      '{"intent":"process.list","args":{},"trigger":"list processes"}'),
+    ("do a vuln scan on eyeqdotnet.com",
+     '{"intent":"nmap.scan_vuln","args":{"target":"eyeqdotnet.com"},"trigger":"nmap vuln scan eyeqdotnet.com"}'),
     ("scan eyeqdotnet.com",
      '{"intent":"nmap.scan_normal","args":{"target":"eyeqdotnet.com"},"trigger":"nmap scan eyeqdotnet.com"}'),
     ("is eyeqdotnet.com working",
@@ -579,13 +641,13 @@ def _validate(result: dict, original_text: str) -> dict:
 # Public classify()
 # ---------------------------------------------------------------------------
 def classify(text: str) -> dict:
-    # Step 1: try keyword pre-classifier first (no LLM needed)
+    # Step 1: keyword pre-classifier (no LLM needed)
     keyword_result = _keyword_classify(text)
     if keyword_result:
         _debug_log(text, "[keyword]", keyword_result)
         return keyword_result
 
-    # Step 2: fall back to LLM
+    # Step 2: LLM fallback
     last_raw = ""
     for attempt in range(2):
         try:
