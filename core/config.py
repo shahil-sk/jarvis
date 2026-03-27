@@ -1,4 +1,4 @@
-"""Config loader — reads config.yaml once at startup."""
+"""Config loader — reads config.yaml once, respects env var overrides."""
 
 import yaml
 import os
@@ -14,6 +14,13 @@ def load(path: str = "config.yaml") -> dict:
         raise FileNotFoundError(f"Config not found: {path}")
     with open(path, "r") as f:
         _cfg = yaml.safe_load(f).get("jarvis", {})
+
+    # Env var overrides (set by CLI before load)
+    if os.environ.get("JARVIS_DEBUG"):
+        _cfg["debug"] = True
+    if os.environ.get("JARVIS_NO_LLM_ROUTING"):
+        _cfg["llm_routing"] = False
+
     return _cfg
 
 
@@ -22,25 +29,20 @@ def get(key: str, default=None):
 
 
 def get_llm_config() -> dict:
-    """Returns the active LLM backend config merged with shared llm settings."""
-    cfg = load()
-    mode = os.environ.get("JARVIS_LLM_MODE") or cfg.get("llm_mode", "openai")
-    backends = cfg.get("llm_backends", {})
-    backend = dict(backends.get(mode, {}))
+    cfg     = load()
+    mode    = os.environ.get("JARVIS_LLM_MODE") or cfg.get("llm_mode", "openai")
+    backend = dict(cfg.get("llm_backends", {}).get(mode, {}))
 
-    # Env var overrides
     if os.environ.get("JARVIS_LLM_API_KEY"):
-        backend["api_key"] = os.environ["JARVIS_LLM_API_KEY"]
+        backend["api_key"]  = os.environ["JARVIS_LLM_API_KEY"]
     if os.environ.get("JARVIS_LLM_URL"):
         backend["base_url"] = os.environ["JARVIS_LLM_URL"]
     if os.environ.get("JARVIS_LLM_MODEL"):
-        backend["model"] = os.environ["JARVIS_LLM_MODEL"]
+        backend["model"]    = os.environ["JARVIS_LLM_MODEL"]
 
-    # Merge shared prompt config
     shared = cfg.get("llm", {})
     backend.setdefault("system_prompt", shared.get(
-        "system_prompt",
-        "You are Jarvis, a fast and helpful AI assistant. Be concise."
+        "system_prompt", "You are Jarvis, a concise AI assistant."
     ))
     backend["_mode"] = mode
     return backend
