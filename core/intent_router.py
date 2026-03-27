@@ -1,17 +1,20 @@
-"""Intent Router v4 — auto-discovery edition.
+"""Intent Router v5 — pre-classifier + auto-discovery edition.
 
 Flow
 ----
 1. Dispatcher calls intent_router.register(registry) after loading plugins.
    This injects the auto-discovered intents into the router's schema.
-2. Every user input goes to the LLM which returns:
+2. Every user input first goes through the keyword pre-classifier.
+   If matched, the LLM is skipped entirely.
+3. If no keyword match, the LLM returns:
      {"intent": "<id>", "args": {...}, "trigger": "<canonical phrase>"}
-3. The dispatcher routes by intent to the right plugin via PluginRegistry.
+4. The dispatcher routes by intent to the right plugin via PluginRegistry.
 
 No manual INTENT_SCHEMA or TRIGGER_MAP entries needed for new plugins.
 Just add PluginCapability objects to your Plugin class.
 """
 
+import re
 import json
 import urllib.request
 import urllib.error
@@ -19,10 +22,6 @@ from core.config import get_llm_config
 
 # ---------------------------------------------------------------------------
 # Core built-in intents that have no dedicated plugin file
-# (system, fs, process, net, web, clip, notify, scheduler, todo, notes,
-#  launcher, github, brightness, stopwatch, env, clipboard_history, llm)
-# These stay here because their plugins were written before the capability
-# system existed. New plugins should use PluginCapability instead.
 # ---------------------------------------------------------------------------
 _BUILTIN_SCHEMA: dict[str, dict] = {
     "system.stats"        : {},
@@ -32,16 +31,28 @@ _BUILTIN_SCHEMA: dict[str, dict] = {
     "system.open"         : {"target": "str"},
     "system.env"          : {"key": "str?"},
     "system.setenv"       : {"key": "str", "value": "str"},
+    "system.services"     : {},
+    "system.battery"      : {},
+    "system.reboot"       : {},
+    "system.shutdown"     : {},
     "fs.find"             : {"pattern": "str"},
     "fs.read"             : {"path": "str"},
+    "fs.write"            : {"path": "str", "content": "str"},
     "fs.list"             : {"path": "str?"},
     "fs.move"             : {"src": "str", "dst": "str"},
     "fs.delete"           : {"path": "str"},
     "fs.mkdir"            : {"path": "str"},
     "fs.pwd"              : {},
+    "fs.copy"             : {"src": "str", "dst": "str"},
+    "fs.stat"             : {"path": "str"},
+    "fs.tree"             : {"path": "str?"},
+    "fs.diskusage"        : {"path": "str?"},
     "process.list"        : {},
     "process.kill"        : {"target": "str"},
     "process.find"        : {"name": "str"},
+    "process.top"         : {"limit": "int?"},
+    "process.suspend"     : {"target": "str"},
+    "process.resume"      : {"target": "str"},
     "net.ping"            : {"host": "str"},
     "net.curl"            : {"url": "str"},
     "net.download"        : {"url": "str"},
@@ -52,6 +63,16 @@ _BUILTIN_SCHEMA: dict[str, dict] = {
     "net.checkurl"        : {"url": "str"},
     "net.localip"         : {},
     "net.speedtest"       : {},
+    "net.traceroute"      : {"host": "str"},
+    "net.headers"         : {"url": "str"},
+    "net.interfaces"      : {},
+    "nmap.scan_normal"    : {"target": "str"},
+    "nmap.scan_silent"    : {"target": "str"},
+    "nmap.scan_full"      : {"target": "str"},
+    "nmap.scan_version"   : {"target": "str"},
+    "nmap.scan_os"        : {"target": "str"},
+    "nmap.scan_vuln"      : {"target": "str"},
+    "nmap.scan_quick"     : {"target": "str"},
     "web.summarize"       : {"url": "str", "focus": "str?"},
     "web.read"            : {"url": "str"},
     "web.ask"             : {"url": "str", "question": "str"},
@@ -128,16 +149,28 @@ _BUILTIN_TRIGGERS: dict[str, str] = {
     "system.open"         : "open {target}",
     "system.env"          : "env {key}",
     "system.setenv"       : "set env {key}={value}",
+    "system.services"     : "list services",
+    "system.battery"      : "battery status",
+    "system.reboot"       : "reboot system",
+    "system.shutdown"     : "shutdown system",
     "fs.find"             : "find {pattern}",
     "fs.read"             : "read {path}",
+    "fs.write"            : "write {path}",
     "fs.list"             : "list {path}",
     "fs.move"             : "move {src} to {dst}",
     "fs.delete"           : "delete file {path}",
     "fs.mkdir"            : "mkdir {path}",
     "fs.pwd"              : "current directory",
+    "fs.copy"             : "copy {src} to {dst}",
+    "fs.stat"             : "stat {path}",
+    "fs.tree"             : "tree {path}",
+    "fs.diskusage"        : "disk usage {path}",
     "process.list"        : "list processes",
     "process.kill"        : "kill {target}",
     "process.find"        : "find process {name}",
+    "process.top"         : "top processes",
+    "process.suspend"     : "suspend {target}",
+    "process.resume"      : "resume {target}",
     "net.ping"            : "ping {host}",
     "net.myip"            : "my public ip",
     "net.localip"         : "my local ip",
@@ -145,6 +178,16 @@ _BUILTIN_TRIGGERS: dict[str, str] = {
     "net.dns"             : "dns {host}",
     "net.checkurl"        : "check url {url}",
     "net.download"        : "download {url}",
+    "net.traceroute"      : "traceroute {host}",
+    "net.headers"         : "headers {url}",
+    "net.interfaces"      : "network interfaces",
+    "nmap.scan_normal"    : "nmap scan {target}",
+    "nmap.scan_silent"    : "nmap silent scan {target}",
+    "nmap.scan_full"      : "nmap full scan {target}",
+    "nmap.scan_version"   : "nmap version scan {target}",
+    "nmap.scan_os"        : "nmap os scan {target}",
+    "nmap.scan_vuln"      : "nmap vuln scan {target}",
+    "nmap.scan_quick"     : "nmap quick scan {target}",
     "web.search"          : "search {query}",
     "web.news"            : "news {topic}",
     "web.summarize"       : "summarize {url}",
@@ -198,7 +241,6 @@ _BUILTIN_TRIGGERS: dict[str, str] = {
     "llm.chat"            : "",
 }
 
-# These are merged at runtime with plugin-provided intents
 INTENT_SCHEMA: dict[str, dict] = dict(_BUILTIN_SCHEMA)
 TRIGGER_MAP  : dict[str, str]  = dict(_BUILTIN_TRIGGERS)
 
@@ -206,11 +248,148 @@ _REQUIRED: dict[str, list] = {}
 _DYNAMIC_EXAMPLES: list[tuple] = []
 
 
+# ---------------------------------------------------------------------------
+# Keyword pre-classifier
+# Catches the most common commands before the LLM is called.
+# Each rule is (regex_pattern, intent, args_fn).
+# args_fn receives the re.Match object and returns a dict.
+# Rules are evaluated top-to-bottom; first match wins.
+# ---------------------------------------------------------------------------
+
+def _url_from(m: re.Match, group: int = 1) -> str:
+    raw = m.group(group).strip()
+    if raw and not raw.startswith("http"):
+        raw = "https://" + raw
+    return raw
+
+
+_PRE_RULES: list[tuple] = [
+    # --- process ---
+    (r"^(list|show|display)\s+(all\s+)?processes?$",
+     "process.list", lambda m: {}),
+    (r"^(list|show|display)\s+(all\s+)?running\s+processes?$",
+     "process.list", lambda m: {}),
+    (r"^(top|top\s+(\d+))\s+processes?",
+     "process.top", lambda m: {"limit": int(m.group(2)) if m.group(2) else 10}),
+    (r"^kill\s+(.+)$",
+     "process.kill", lambda m: {"target": m.group(1).strip()}),
+    (r"^(find|search)\s+process\s+(.+)$",
+     "process.find", lambda m: {"name": m.group(2).strip()}),
+
+    # --- filesystem ---
+    (r"^(list|ls|show)\s+(files?\s+)?(?:from|in|at)?\s+(.+)$",
+     "fs.list", lambda m: {"path": m.group(3).strip()}),
+    (r"^(list|ls)\s*$",
+     "fs.list", lambda m: {}),
+    (r"^read\s+(file\s+)?(.+)$",
+     "fs.read", lambda m: {"path": m.group(2).strip()}),
+    (r"^(tree|show tree)\s*(.*)$",
+     "fs.tree", lambda m: {"path": m.group(2).strip() or "."}),
+    (r"^(disk\s*usage|du)\s*(.*)$",
+     "fs.diskusage", lambda m: {"path": m.group(2).strip() or "."}),
+    (r"^(stat|info)\s+(.+)$",
+     "fs.stat", lambda m: {"path": m.group(2).strip()}),
+    (r"^(pwd|current\s+dir(?:ectory)?)$",
+     "fs.pwd", lambda m: {}),
+    (r"^(find|search)\s+files?\s+(.+)$",
+     "fs.find", lambda m: {"pattern": m.group(2).strip()}),
+    (r"^mkdir\s+(.+)$",
+     "fs.mkdir", lambda m: {"path": m.group(1).strip()}),
+    (r"^(delete|remove|rm)\s+(file\s+)?(.+)$",
+     "fs.delete", lambda m: {"path": m.group(3).strip()}),
+
+    # --- network ---
+    (r"^ping\s+(.+)$",
+     "net.ping", lambda m: {"host": m.group(1).strip()}),
+    (r"^(check|is|test)\s+(.+?)\s+(working|up|down|online|reachable)\??$",
+     "net.checkurl", lambda m: {"url": _url_from(m, 2)}),
+    (r"^(check\s+url|checkurl)\s+(.+)$",
+     "net.checkurl", lambda m: {"url": _url_from(m, 2)}),
+    (r"^(my\s+)?(public\s+)?ip(\s+address)?$",
+     "net.myip", lambda m: {}),
+    (r"^(my\s+)?local\s+ip(\s+address)?$",
+     "net.localip", lambda m: {}),
+    (r"^(speed\s*test|test\s+(my\s+)?speed)$",
+     "net.speedtest", lambda m: {}),
+    (r"^(dns|nslookup)\s+(.+)$",
+     "net.dns", lambda m: {"host": m.group(2).strip()}),
+    (r"^(traceroute|tracert)\s+(.+)$",
+     "net.traceroute", lambda m: {"host": m.group(2).strip()}),
+    (r"^(headers|http\s+headers)\s+(.+)$",
+     "net.headers", lambda m: {"url": _url_from(m, 2)}),
+    (r"^(network\s+)?(interfaces?|adapters?)$",
+     "net.interfaces", lambda m: {}),
+    (r"^(download|fetch)\s+(.+)$",
+     "net.download", lambda m: {"url": _url_from(m, 2)}),
+    (r"^curl\s+(.+)$",
+     "net.curl", lambda m: {"url": _url_from(m, 1)}),
+
+    # --- nmap ---
+    (r"^(nmap\s+)?(scan|nmap)\s+(--vuln|-sV|--full|-sn)?\s*(.+)$",
+     "nmap.scan_normal", lambda m: {"target": m.group(4).strip()}),
+    (r"^(full|deep)\s+scan\s+(.+)$",
+     "nmap.scan_full", lambda m: {"target": m.group(2).strip()}),
+    (r"^(vuln|vulnerability)\s+scan\s+(.+)$",
+     "nmap.scan_vuln", lambda m: {"target": m.group(2).strip()}),
+    (r"^(os|os\s+detect(?:ion)?)\s+scan\s+(.+)$",
+     "nmap.scan_os", lambda m: {"target": m.group(2).strip()}),
+    (r"^(version|service)\s+scan\s+(.+)$",
+     "nmap.scan_version", lambda m: {"target": m.group(2).strip()}),
+    (r"^(silent|stealth|quiet)\s+scan\s+(.+)$",
+     "nmap.scan_silent", lambda m: {"target": m.group(2).strip()}),
+    (r"^(quick)\s+scan\s+(.+)$",
+     "nmap.scan_quick", lambda m: {"target": m.group(2).strip()}),
+
+    # --- system ---
+    (r"^(system\s+)?(stats?|status|usage)$",
+     "system.stats", lambda m: {}),
+    (r"^(system\s+)?uptime$",
+     "system.uptime", lambda m: {}),
+    (r"^(system\s+)?(info|sysinfo|system\s+information)$",
+     "system.sysinfo", lambda m: {}),
+    (r"^(list\s+)?services?$",
+     "system.services", lambda m: {}),
+    (r"^battery(\s+status)?$",
+     "system.battery", lambda m: {}),
+    (r"^(run|exec|execute|shell)\s+(.+)$",
+     "system.shell", lambda m: {"cmd": m.group(2).strip()}),
+    (r"^(open|launch|start)\s+(.+)$",
+     "system.open", lambda m: {"target": m.group(2).strip()}),
+]
+
+# Compile all patterns once at import time
+_PRE_RULES_COMPILED = [
+    (re.compile(pattern, re.IGNORECASE), intent, args_fn)
+    for pattern, intent, args_fn in _PRE_RULES
+]
+
+
+def _keyword_classify(text: str) -> dict | None:
+    """
+    Try to match user input against keyword rules.
+    Returns a classified dict if matched, None otherwise.
+    """
+    stripped = text.strip()
+    for pattern, intent, args_fn in _PRE_RULES_COMPILED:
+        m = pattern.match(stripped)
+        if m:
+            try:
+                args = args_fn(m)
+            except Exception:
+                args = {}
+            trigger = TRIGGER_MAP.get(intent, intent)
+            try:
+                trigger = trigger.format_map(args)
+            except KeyError:
+                pass
+            return {"intent": intent, "args": args, "trigger": trigger, "_source": "keyword"}
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Plugin registry merge
+# ---------------------------------------------------------------------------
 def register(registry) -> None:
-    """
-    Called by the dispatcher after plugins are loaded.
-    Merges plugin-declared capabilities into the live schema.
-    """
     global _REQUIRED, _DYNAMIC_EXAMPLES, _CACHED_PROMPT
 
     INTENT_SCHEMA.update(registry.intent_schema)
@@ -221,7 +400,7 @@ def register(registry) -> None:
         k: [a for a, t in v.items() if not t.endswith("?")]
         for k, v in INTENT_SCHEMA.items()
     }
-    _CACHED_PROMPT = None  # force rebuild
+    _CACHED_PROMPT = None
     print(f"[router] registered {len(registry.intent_schema)} plugin-declared intents")
 
 
@@ -245,13 +424,20 @@ _BUILTIN_EXAMPLES = [
      '{"intent":"todo.add","args":{"title":"fix the login bug","priority":"high"},"trigger":"add todo fix the login bug"}'),
     ("show my todos",
      '{"intent":"todo.list","args":{},"trigger":"list todos"}'),
+    ("list all running processes",
+     '{"intent":"process.list","args":{},"trigger":"list processes"}'),
+    ("scan eyeqdotnet.com",
+     '{"intent":"nmap.scan_normal","args":{"target":"eyeqdotnet.com"},"trigger":"nmap scan eyeqdotnet.com"}'),
+    ("is eyeqdotnet.com working",
+     '{"intent":"net.checkurl","args":{"url":"https://eyeqdotnet.com"},"trigger":"check url https://eyeqdotnet.com"}'),
+    ("read files from /home/user/downloads",
+     '{"intent":"fs.list","args":{"path":"/home/user/downloads"},"trigger":"list /home/user/downloads"}'),
     ("explain how docker works",
      '{"intent":"llm.chat","args":{},"trigger":""}'),
 ]
 
 
 def _build_system_prompt() -> str:
-    # Merge builtin + plugin-provided examples
     all_examples = list(_BUILTIN_EXAMPLES)
     for intent, phrase, args_dict, trigger_tpl in _DYNAMIC_EXAMPLES:
         try:
@@ -279,7 +465,7 @@ def _build_system_prompt() -> str:
         "4. Time    -- convert to delay_seconds: minutes*60, hours*3600, days*86400.\n"
         "5. Strip filler words (please, can you, could you, etc.) from titles/messages.\n"
         "6. If the user is asking a general question with no clear OS action, use llm.chat.\n"
-        "7. NEVER return anything except the JSON object.\n"
+        "7. NEVER return anything except the JSON object. No prose. No explanation.\n"
         "\n"
         "=== INTENT SCHEMA ===\n" + "\n".join(schema_lines) + "\n\n"
         "=== TRIGGER MAP ===\n" + "\n".join(trigger_lines) + "\n\n"
@@ -393,6 +579,13 @@ def _validate(result: dict, original_text: str) -> dict:
 # Public classify()
 # ---------------------------------------------------------------------------
 def classify(text: str) -> dict:
+    # Step 1: try keyword pre-classifier first (no LLM needed)
+    keyword_result = _keyword_classify(text)
+    if keyword_result:
+        _debug_log(text, "[keyword]", keyword_result)
+        return keyword_result
+
+    # Step 2: fall back to LLM
     last_raw = ""
     for attempt in range(2):
         try:
@@ -427,4 +620,5 @@ def _debug_log(text: str, raw: str, result: dict) -> None:
         print(f"[router] llm_raw : {raw!r}")
     print(f"[router] intent  : {result.get('intent')}")
     print(f"[router] args    : {result.get('args')}")
+    print(f"[router] source  : {result.get('_source', 'llm')}")
     print(f"[router] trigger : {result.get('trigger')!r}")
