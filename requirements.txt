@@ -1,1 +1,4 @@
 pyyaml>=6.0
+# No extra deps for LLM plugin — uses stdlib urllib only
+# Add below only if you want streaming or async later:
+# httpx>=0.27

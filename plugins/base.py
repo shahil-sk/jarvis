@@ -2,17 +2,16 @@
 
 from abc import ABC, abstractmethod
 
+
 class PluginBase(ABC):
     """
-    Subclass this and implement:
-      matches(text) -> bool   : return True if this plugin handles the input
-      run(text, memory) -> str : execute and return a response string
+    priority (int): lower = runs first. Default 100.
+                    LLM fallback uses 999 to always run last.
     """
+    priority: int = 100
 
     @abstractmethod
-    def matches(self, text: str) -> bool:
-        ...
+    def matches(self, text: str) -> bool: ...
 
     @abstractmethod
-    def run(self, text: str, memory) -> str:
-        ...
+    def run(self, text: str, memory) -> str: ...
