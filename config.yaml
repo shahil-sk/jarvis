@@ -5,8 +5,24 @@ jarvis:
   memory:
     max_entries: 50
     persist: true
-    db_path: ~/.jarvis/memory.db   # all notes + history stored here
+    db_path: ~/.jarvis/memory.db
   plugins_dir: plugins
+
+  # --- WORKSPACES -----------------------------------------
+  # Each key is a workspace name. Items can be:
+  #   app names, file/folder paths, or https:// URLs
+  workspaces:
+    dev:
+      - code
+      - https://github.com/shahil-sk
+      - ~/projects
+
+    work:
+      - https://mail.google.com
+      - https://calendar.google.com
+
+    monitor:
+      - https://github.com/shahil-sk/jarvis
 
   # --- LLM MODE -------------------------------------------
   llm_mode: lmstudio
