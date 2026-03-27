@@ -1,21 +1,17 @@
-"""Dispatcher v3 — LLM-first pipeline.
+"""Dispatcher v4 — auto-discovery edition.
 
 Dispatch flow
 -------------
-1. intent_router.classify(text)  -> {intent, args, trigger}
-2. If intent is recognised in _route() -> call the right plugin method with typed args.
-3. If intent == "llm.chat"        -> pass original text to llm plugin.
-4. Keyword-fallback mode (--no-llm-routing):
-     - Still calls classify() to get a normalised trigger.
-     - Passes trigger (not raw user text) to plugin.matches() / plugin.run().
-     - This means every plugin reliably receives text it was designed to handle.
+1. Load all plugins from plugins/ directory.
+2. Build PluginRegistry from plugin capabilities (auto-discovery).
+3. Register capabilities with intent_router so LLM knows about them.
+4. For each user input:
+   a. intent_router.classify(text) -> {intent, args, trigger}
+   b. Check registry for a plugin that owns the intent -> call run_intent()
+   c. Fall through to built-in plugin routing for legacy plugins
+   d. LLM fallback as last resort
 
-Robustness
-----------
-- Every plugin load is isolated; one broken plugin never blocks the others.
-- _call() wraps every plugin method call; exceptions become error strings.
-- dispatch() always returns str, never None.
-- _failed_plugins records load errors for --list-plugins.
+Adding a new plugin with PluginCapability never requires editing this file.
 """
 
 import importlib
@@ -26,6 +22,7 @@ import plugins as plugin_pkg
 from plugins.base import PluginBase
 from core import intent_router
 from core.config import get
+from core.plugin_registry import PluginRegistry
 
 _PRI_MAP = {"low": 1, "medium": 2, "med": 2, "high": 3, "urgent": 4, "critical": 4}
 
@@ -33,24 +30,25 @@ _PRI_MAP = {"low": 1, "medium": 2, "med": 2, "high": 3, "urgent": 4, "critical":
 def _validate_plugin(name: str, instance: PluginBase) -> list[str]:
     warnings = []
     if not callable(getattr(instance, "matches", None)):
-        warnings.append("missing callable 'matches(text)'")
+        warnings.append("missing matches(text)")
     if not callable(getattr(instance, "run", None)):
-        warnings.append("missing callable 'run(text, memory)'")
+        warnings.append("missing run(text, memory)")
     if not isinstance(getattr(instance, "priority", None), int):
-        warnings.append("'priority' is not an int -- defaulting to 100")
+        warnings.append("priority not int, defaulting to 100")
         instance.priority = 100
     return warnings
 
 
 class Dispatcher:
     def __init__(self):
-        self._plugins: dict[str, PluginBase] = {}
-        self._failed_plugins: dict[str, str] = {}
+        self._plugins       : dict[str, PluginBase] = {}
+        self._failed_plugins: dict[str, str]        = {}
+        self._registry      : PluginRegistry        = PluginRegistry()
         self._load_plugins()
         self._use_llm_routing = get("llm_routing", True)
 
     # ------------------------------------------------------------------ #
-    # Plugin loading
+    # Plugin loading + registry build
     # ------------------------------------------------------------------ #
 
     def _load_plugins(self) -> None:
@@ -65,19 +63,15 @@ class Dispatcher:
                 print(f"[dispatcher] x '{name}' failed to import: {exc}")
                 continue
             cls = getattr(mod, "Plugin", None)
-            if cls is None:
-                self._failed_plugins[name] = "no class named 'Plugin' in plugin.py"
-                print(f"[dispatcher] x '{name}': no Plugin class")
-                continue
-            if not (isinstance(cls, type) and issubclass(cls, PluginBase)):
-                self._failed_plugins[name] = "Plugin does not subclass PluginBase"
-                print(f"[dispatcher] x '{name}': not a PluginBase subclass")
+            if cls is None or not (isinstance(cls, type) and issubclass(cls, PluginBase)):
+                self._failed_plugins[name] = "no valid Plugin class"
+                print(f"[dispatcher] x '{name}': no valid Plugin class")
                 continue
             try:
                 instance = cls()
             except Exception as exc:
-                self._failed_plugins[name] = f"__init__ raised: {exc}"
-                print(f"[dispatcher] x '{name}' failed to instantiate: {exc}")
+                self._failed_plugins[name] = f"init failed: {exc}"
+                print(f"[dispatcher] x '{name}' init failed: {exc}")
                 continue
             for w in _validate_plugin(name, instance):
                 print(f"[dispatcher] ! '{name}': {w}")
@@ -85,19 +79,26 @@ class Dispatcher:
 
         loaded.sort(key=lambda x: getattr(x[1], "priority", 100))
         self._plugins = {n: i for n, i in loaded}
+
+        # Auto-discover capabilities from all loaded plugins
+        self._registry.build(self._plugins)
+        intent_router.register(self._registry)
+
         ok  = list(self._plugins.keys())
         bad = list(self._failed_plugins.keys())
         print(f"[dispatcher] loaded ({len(ok)}): {ok}")
         if bad:
             print(f"[dispatcher] failed ({len(bad)}): {bad}")
+        if self._registry._intent_owners:
+            print(f"[dispatcher] plugin intents:\n{self._registry.summary()}")
 
     def reload_plugins(self) -> str:
-        """Hot-reload all plugins without restarting Jarvis."""
         to_remove = [k for k in sys.modules if k.startswith("plugins.") and k != "plugins.base"]
         for k in to_remove:
             sys.modules.pop(k, None)
         self._plugins.clear()
         self._failed_plugins.clear()
+        self._registry = PluginRegistry()
         self._load_plugins()
         return f"Plugins reloaded -- {len(self._plugins)} loaded, {len(self._failed_plugins)} failed."
 
@@ -116,19 +117,33 @@ class Dispatcher:
             result = fn(*args, **kwargs)
             return result if isinstance(result, str) else str(result)
         except Exception as exc:
-            print(f"[dispatcher] x {plugin_name}.{method} raised:\n{traceback.format_exc()}")
+            print(f"[dispatcher] x {plugin_name}.{method}:\n{traceback.format_exc()}")
             return f"[{plugin_name}] error: {exc}"
 
     def _run(self, plugin_name: str, text: str, memory) -> str:
         return self._call(plugin_name, "run", text, memory)
 
     # ------------------------------------------------------------------ #
-    # Intent -> plugin routing
+    # Dynamic routing via PluginRegistry (new plugins — zero config)
     # ------------------------------------------------------------------ #
 
-    def _route(self, intent: str, args: dict, text: str, trigger: str, memory) -> str:  # noqa: C901
-        p = self._plugins
+    def _route_dynamic(self, intent: str, args: dict) -> str | None:
+        """
+        Check registry for a plugin that declared ownership of this intent.
+        Calls plugin.run_intent(intent, args) and returns the result.
+        Returns None if no registered plugin owns this intent.
+        """
+        owner = self._registry.owner_of(intent)
+        if owner and owner in self._plugins:
+            return self._call(owner, "run_intent", intent, args)
+        return None
 
+    # ------------------------------------------------------------------ #
+    # Legacy built-in routing (existing plugins pre-capability system)
+    # ------------------------------------------------------------------ #
+
+    def _route_builtin(self, intent: str, args: dict, text: str, trigger: str, memory) -> str | None:  # noqa: C901
+        p = self._plugins
         # system
         if intent == "system.stats"   and "system" in p: return self._call("system", "_stats", text)
         if intent == "system.uptime"  and "system" in p: return self._call("system", "_uptime", text)
@@ -179,8 +194,7 @@ class Dispatcher:
             if intent == "scheduler.add":
                 return self._call("scheduler", "add_structured",
                     delay_seconds=int(args.get("delay_seconds") or 60),
-                    message=args.get("message", "Reminder!"),
-                    repeat=args.get("repeat", ""))
+                    message=args.get("message", "Reminder!"), repeat=args.get("repeat", ""))
             if intent == "scheduler.add_at":
                 import re as _re, time as _t
                 ts = args.get("time_str", "")
@@ -208,9 +222,8 @@ class Dispatcher:
                 pri_raw = args.get("priority", "medium")
                 pri = _PRI_MAP.get(str(pri_raw).lower(), 2) if isinstance(pri_raw, str) else int(pri_raw)
                 return self._call("todo", "add",
-                    title=args.get("title",""), priority=pri,
-                    tags=args.get("tags",""), due=args.get("due",""),
-                    project=args.get("project",""))
+                    title=args.get("title",""), priority=pri, tags=args.get("tags",""),
+                    due=args.get("due",""), project=args.get("project",""))
             if intent == "todo.list"    : return self._call("todo", "list_todos", args.get("status",""), args.get("tag",""), args.get("project",""))
             if intent == "todo.complete": return self._call("todo", "complete", int(args.get("id",0)))
             if intent == "todo.start"   : return self._call("todo", "start", int(args.get("id",0)))
@@ -225,8 +238,8 @@ class Dispatcher:
                 pri = _PRI_MAP.get(str(pri_raw).lower(), 0) if pri_raw else 0
                 return self._call("todo", "edit",
                     todo_id=int(args.get("id",0)), title=args.get("title",""),
-                    priority=pri, tags=args.get("tags",""),
-                    due=args.get("due",""), project=args.get("project",""))
+                    priority=pri, tags=args.get("tags",""), due=args.get("due",""),
+                    project=args.get("project",""))
         # notes
         if intent == "notes.save"    and "notes" in p: return self._call("notes", "_save", f"save note {args.get('content','')} #{args.get('tag','')}", memory)
         if intent == "notes.list"    and "notes" in p: return self._call("notes", "_list", f"show notes #{args.get('tag','')}", memory)
@@ -260,16 +273,10 @@ class Dispatcher:
         # clipboard history
         if intent.startswith("clip_history.") and "clipboard_history" in p:
             return self._run("clipboard_history", trigger, memory)
-        # nmap
-        if intent.startswith("nmap.") and "nmap" in p:
-            return self._call("nmap", "run_intent", intent, args.get("target", ""))
-        # LLM fallback
-        if "llm" in p:
-            return self._run("llm", text, memory)
-        return "I don't know how to handle that yet."
+        return None
 
     # ------------------------------------------------------------------ #
-    # Public dispatch -- always returns str
+    # Public dispatch
     # ------------------------------------------------------------------ #
 
     def dispatch(self, text: str, memory) -> str:
@@ -277,7 +284,7 @@ class Dispatcher:
             return ""
         try:
             try:
-                result  = intent_router.classify(text)
+                result = intent_router.classify(text)
             except Exception as exc:
                 print(f"[dispatcher] intent_router failed: {exc}")
                 result = {"intent": "llm.chat", "args": {}, "trigger": text}
@@ -289,19 +296,33 @@ class Dispatcher:
             if get("debug", False):
                 print(f"[router] intent={intent}  args={args}  trigger={trigger!r}")
 
+            # keyword-fallback mode
             if not self._use_llm_routing:
                 for _, plugin in self._plugins.items():
                     try:
                         if plugin.matches(trigger):
-                            result = plugin.run(trigger, memory)
-                            return result if isinstance(result, str) else str(result)
+                            res = plugin.run(trigger, memory)
+                            return res if isinstance(res, str) else str(res)
                     except Exception as exc:
                         print(f"[dispatcher] plugin raised in keyword mode: {exc}")
                         continue
                 return "No plugin matched."
 
-            return self._route(intent, args, text, trigger, memory)
+            # 1. Try dynamic routing (self-describing plugins — zero config)
+            dynamic_result = self._route_dynamic(intent, args)
+            if dynamic_result is not None:
+                return dynamic_result
+
+            # 2. Try legacy built-in routing
+            builtin_result = self._route_builtin(intent, args, text, trigger, memory)
+            if builtin_result is not None:
+                return builtin_result
+
+            # 3. LLM fallback
+            if "llm" in self._plugins:
+                return self._run("llm", text, memory)
+            return "I don't know how to handle that yet."
 
         except Exception as exc:
-            print(f"[dispatcher] Unhandled exception:\n{traceback.format_exc()}")
+            print(f"[dispatcher] unhandled:\n{traceback.format_exc()}")
             return f"An internal error occurred: {exc}"
