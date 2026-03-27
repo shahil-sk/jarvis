@@ -14,8 +14,8 @@ jarvis:
   llm_backends:
     lmstudio:
       base_url: "http://localhost:1234/v1"
-      api_key: "lm-studio"
-      model: "local-model"
+      api_key: sk-lm-41cuhi2W:ZSg1R5dsjO6qQRPaEPrn    # LM Studio ignores this but needs a non-empty value
+      model: liquid/lfm2.5-1.2b
     openai:
       base_url: "https://api.openai.com/v1"
       api_key: "sk-YOUR_OPENAI_KEY"
