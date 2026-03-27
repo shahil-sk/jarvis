@@ -1,5 +1,6 @@
-"""Agent — REPL loop."""
+"""Agent — REPL loop with graceful error recovery."""
 
+import traceback
 from core.config import get
 from core.memory import Memory
 from core.dispatcher import Dispatcher
@@ -12,35 +13,74 @@ class Agent:
         self.memory     = Memory()
         self.dispatcher = Dispatcher()
 
-    def run(self):
-        mode = __import__("core.config", fromlist=["get_llm_config"]).get_llm_config().get("_mode", "?")
+    def run(self) -> None:
+        """Interactive REPL — catches all errors per-turn so one crash never kills the session."""
+        try:
+            mode = __import__("core.config", fromlist=["get_llm_config"]).get_llm_config().get("_mode", "?")
+        except Exception:
+            mode = "unknown"
+
         print(f"{self.name} online  [llm: {mode}]  Type 'exit' to quit.\n")
+
+        consecutive_errors = 0
+        MAX_CONSECUTIVE_ERRORS = 5
+
         while True:
             try:
                 user_input = input("You: ").strip()
-            except (EOFError, KeyboardInterrupt):
-                print(f"\n{self.name} shutting down.")
+            except EOFError:
+                print(f"\n{self.name}: EOF received — shutting down.")
                 break
+            except KeyboardInterrupt:
+                print(f"\n{self.name}: Interrupted. Type 'exit' to quit.")
+                continue
 
             if not user_input:
                 continue
+
             if user_input.lower() in ("exit", "quit", "bye"):
                 print(f"{self.name}: Goodbye.")
                 break
+
             if user_input.lower() in ("help", "?"):
                 print(_HELP)
                 continue
 
-            self.memory.add("user", user_input)
-            response = self.dispatcher.dispatch(user_input, self.memory)
-            self.memory.add("assistant", response)
-            print(f"\n{self.name}: {response}\n")
+            if user_input.lower() == "reload plugins":
+                print(self.dispatcher.reload_plugins())
+                continue
+
+            try:
+                self.memory.add("user", user_input)
+                response = self.dispatcher.dispatch(user_input, self.memory)
+                # Guarantee response is never None or non-string
+                if not isinstance(response, str):
+                    response = str(response) if response is not None else ""
+                self.memory.add("assistant", response)
+                print(f"\n{self.name}: {response}\n")
+                consecutive_errors = 0
+
+            except KeyboardInterrupt:
+                print(f"\n{self.name}: Command interrupted.")
+                consecutive_errors = 0
+                continue
+
+            except Exception as exc:
+                consecutive_errors += 1
+                print(f"\n{self.name}: Something went wrong — {exc}")
+                if self.debug:
+                    traceback.print_exc()
+                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                    print(f"{self.name}: Too many consecutive errors ({MAX_CONSECUTIVE_ERRORS}). "
+                          "Please check your config or run with --debug.")
+                    consecutive_errors = 0
 
 
 _HELP = """
 Built-in commands:
   exit / quit / bye    — shutdown Jarvis
   help / ?             — show this help
+  reload plugins       — hot-reload all plugins without restarting
 
 Just talk naturally. Examples:
   how much ram am i using
@@ -54,4 +94,8 @@ Just talk naturally. Examples:
   run git pull
   kill firefox
   what's my public ip
+  brightness set 70
+  clipboard history
+  env PATH
+  start stopwatch build
 """
