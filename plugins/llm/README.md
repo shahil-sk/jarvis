@@ -1,33 +1,49 @@
 # LLM Plugin
 
-Fallback plugin — if no other plugin matches, this sends the conversation to an LLM.
+Fallback brain. Catches any input no other plugin handles.
+Uses `stdlib urllib` only — zero extra dependencies.
 
-## Supported Backends
+## Switch Backend
 
-| Backend | base_url |
-|---|---|
-| OpenAI | `https://api.openai.com/v1` |
-| Groq | `https://api.groq.com/openai/v1` |
-| Ollama (local) | `http://localhost:11434/v1` |
-| LM Studio | `http://localhost:1234/v1` |
-| OpenRouter | `https://openrouter.ai/api/v1` |
-
-## Config (config.yaml)
-
+Edit `config.yaml`:
 ```yaml
 jarvis:
-  llm:
-    base_url: https://api.groq.com/openai/v1
-    api_key: your_key_here   # or set JARVIS_LLM_API_KEY env var
-    model: llama-3.3-70b-versatile
-    max_tokens: 512
-    temperature: 0.7
-    system_prompt: "You are Jarvis, a concise AI assistant."
+  llm_mode: lmstudio   # openai | groq | lmstudio | ollama | openrouter
 ```
 
-## Env Vars (override config)
+Or use an env var (overrides config):
 ```bash
-export JARVIS_LLM_URL=http://localhost:11434/v1
-export JARVIS_LLM_API_KEY=ollama
-export JARVIS_LLM_MODEL=mistral
+export JARVIS_LLM_MODE=ollama
 ```
+
+## Backend Quick-Start
+
+### LM Studio (local)
+1. Download [LM Studio](https://lmstudio.ai)
+2. Load any GGUF model
+3. Start the local server (default port 1234)
+4. Set `llm_mode: lmstudio` in config.yaml
+5. Set `model:` to whatever name LM Studio shows
+
+### Ollama (local)
+```bash
+curl -fsSL https://ollama.com/install.sh | sh
+ollama pull mistral
+# set llm_mode: ollama, model: mistral
+```
+
+### Groq (cloud, fast free tier)
+```bash
+export JARVIS_LLM_API_KEY=your_groq_key
+# set llm_mode: groq in config.yaml
+```
+
+## Backend Comparison
+
+| Backend | Local | Free | Speed | Privacy |
+|---|---|---|---|---|
+| LM Studio | ✅ | ✅ | medium | full |
+| Ollama | ✅ | ✅ | medium | full |
+| Groq | ❌ | free tier | ⚡ fast | cloud |
+| OpenAI | ❌ | paid | fast | cloud |
+| OpenRouter | ❌ | some free | varies | cloud |

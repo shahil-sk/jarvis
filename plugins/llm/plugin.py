@@ -1,59 +1,43 @@
-"""LLM plugin — fallback brain using any OpenAI-compatible API."""
+"""LLM plugin — fallback brain, supports all OpenAI-compatible backends."""
 
-import os
 import json
 import urllib.request
 import urllib.error
 from plugins.base import PluginBase
-from core.config import get
+from core.config import get_llm_config
 
 
 class Plugin(PluginBase):
-    """
-    Catches anything no other plugin handles.
-    Sends full session memory as context to the LLM.
-    Config via config.yaml [jarvis.llm] or env vars.
-    """
-
-    # Lowest priority — always matches as last resort
-    priority = 999
+    priority = 999  # last resort fallback
 
     def __init__(self):
-        cfg = get("llm", {})
-        self._base_url = (
-            os.environ.get("JARVIS_LLM_URL")
-            or cfg.get("base_url", "https://api.openai.com/v1")
-        ).rstrip("/")
-        self._api_key = (
-            os.environ.get("JARVIS_LLM_API_KEY")
-            or cfg.get("api_key", "")
-        )
-        self._model = (
-            os.environ.get("JARVIS_LLM_MODEL")
-            or cfg.get("model", "gpt-4o-mini")
-        )
-        self._max_tokens = cfg.get("max_tokens", 512)
-        self._temperature = cfg.get("temperature", 0.7)
-        self._system_prompt = cfg.get(
-            "system_prompt",
-            "You are Jarvis, a fast and helpful AI assistant. "
-            "Be concise. Avoid unnecessary filler."
-        )
+        self._reload()
+
+    def _reload(self):
+        cfg = get_llm_config()
+        self._base_url = cfg.get("base_url", "http://localhost:1234/v1").rstrip("/")
+        self._api_key  = cfg.get("api_key", "lm-studio")
+        self._model    = cfg.get("model", "local-model")
+        self._max_tok  = cfg.get("max_tokens", 512)
+        self._temp     = cfg.get("temperature", 0.7)
+        self._sysprompt = cfg.get("system_prompt", "You are Jarvis, a concise AI assistant.")
+        self._mode     = cfg.get("_mode", "unknown")
+        print(f"[llm] mode={self._mode}  model={self._model}  url={self._base_url}")
 
     def matches(self, text: str) -> bool:
-        return True  # fallback — always matches
+        return True
 
     def run(self, text: str, memory) -> str:
-        messages = [{"role": "system", "content": self._system_prompt}]
+        messages = [{"role": "system", "content": self._sysprompt}]
         for entry in memory.last(10):
             messages.append({"role": entry["role"], "content": entry["content"]})
 
         payload = json.dumps({
             "model": self._model,
             "messages": messages,
-            "max_tokens": self._max_tokens,
-            "temperature": self._temperature,
-        }).encode("utf-8")
+            "max_tokens": self._max_tok,
+            "temperature": self._temp,
+        }).encode()
 
         req = urllib.request.Request(
             f"{self._base_url}/chat/completions",
@@ -66,11 +50,18 @@ class Plugin(PluginBase):
         )
 
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                data = json.loads(resp.read().decode())
                 return data["choices"][0]["message"]["content"].strip()
         except urllib.error.HTTPError as e:
-            body = e.read().decode("utf-8", errors="replace")
-            return f"[LLM error {e.code}] {body[:200]}"
+            body = e.read().decode(errors="replace")
+            return f"[LLM {self._mode} error {e.code}]: {body[:300]}"
+        except urllib.error.URLError as e:
+            if "Connection refused" in str(e):
+                return (
+                    f"[LLM] Cannot reach {self._mode} at {self._base_url}.\n"
+                    f"Is LM Studio / Ollama running? Check config.yaml llm_mode."
+                )
+            return f"[LLM network error]: {e}"
         except Exception as e:
-            return f"[LLM error] {e}"
+            return f"[LLM error]: {e}"

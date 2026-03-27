@@ -5,12 +5,49 @@ jarvis:
   memory:
     max_entries: 50
   plugins_dir: plugins
+
+  # --- LLM MODE -------------------------------------------
+  # Set mode to: "openai" | "groq" | "lmstudio" | "ollama" | "openrouter"
+  # Each section below is self-contained. Only active mode is used.
+  llm_mode: lmstudio
+
+  llm_backends:
+    openai:
+      base_url: https://api.openai.com/v1
+      api_key: ""            # or env: JARVIS_LLM_API_KEY
+      model: gpt-4o-mini
+      max_tokens: 512
+      temperature: 0.7
+
+    groq:
+      base_url: https://api.groq.com/openai/v1
+      api_key: ""            # or env: JARVIS_LLM_API_KEY
+      model: llama-3.3-70b-versatile
+      max_tokens: 512
+      temperature: 0.7
+
+    lmstudio:
+      base_url: http://localhost:1234/v1
+      api_key: lm-studio    # LM Studio ignores this but needs a non-empty value
+      model: local-model    # must match the model name shown in LM Studio
+      max_tokens: 512
+      temperature: 0.7
+
+    ollama:
+      base_url: http://localhost:11434/v1
+      api_key: ollama       # Ollama ignores this
+      model: mistral        # any model you have pulled: llama3, phi3, gemma, etc.
+      max_tokens: 512
+      temperature: 0.7
+
+    openrouter:
+      base_url: https://openrouter.ai/api/v1
+      api_key: ""            # or env: JARVIS_LLM_API_KEY
+      model: mistralai/mistral-7b-instruct
+      max_tokens: 512
+      temperature: 0.7
+
   llm:
-    base_url: https://api.openai.com/v1  # swap to Groq/Ollama/LM Studio freely
-    api_key: ""                           # or set JARVIS_LLM_API_KEY env var
-    model: gpt-4o-mini
-    max_tokens: 512
-    temperature: 0.7
     system_prompt: >
       You are Jarvis, a fast and helpful AI assistant.
       Be concise. Avoid filler. Answer directly.
