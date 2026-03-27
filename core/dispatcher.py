@@ -1,11 +1,4 @@
-"""Dispatcher — LLM-powered intent routing with plugin fallback.
-
-Flow:
-  user input
-    └→ intent_router.classify()   (fast LLM call, temp=0, max_tokens=150)
-        └→ route to plugin handler via intent map
-            └→ if llm.chat or unmatched → LLM plugin (full response)
-"""
+"""Dispatcher — LLM-powered intent routing with plugin fallback."""
 
 import importlib
 import pkgutil
@@ -37,8 +30,6 @@ class Dispatcher:
         loaded.sort(key=lambda x: getattr(x[1], "priority", 100))
         self._plugins = {name: inst for name, inst in loaded}
         print(f"[dispatcher] loaded: {list(self._plugins.keys())}")
-
-    # ── intent → plugin method map ─────────────────────────────────────
 
     def _route(self, intent: str, args: dict, text: str, memory) -> str:
         p = self._plugins
@@ -83,23 +74,16 @@ class Dispatcher:
         if intent == "clip.write" and "clipboard" in p: return p["clipboard"]._write(f"copy to clipboard {args.get('content','')}")
 
         # notify
-        if intent == "notify.send" and "notify" in p: return p["notify"]._notify("Jarvis", args.get("message", ""))
+        if intent == "notify.send" and "notify" in p:
+            return p["notify"]._notify("Jarvis", args.get("message", ""))
 
-        # scheduler
+        # scheduler — delegate cleanly to plugin methods
         if intent == "scheduler.add" and "scheduler" in p:
-            import time, sqlite3, os
-            delay   = int(args.get("delay_seconds", 60))
-            message = args.get("message", "Reminder!")
-            repeat  = args.get("repeat", "")
-            fire_at = time.time() + delay
-            sch = p["scheduler"]
-            con = sqlite3.connect(sch._db_path)
-            cur = con.execute("INSERT INTO reminders (fire_at, message, repeat) VALUES (?,?,?)",
-                              (fire_at, message, repeat))
-            rid = cur.lastrowid
-            con.commit(); con.close()
-            when = time.strftime("%H:%M:%S", time.localtime(fire_at))
-            return f"Reminder #{rid} set for {when}{' repeats '+repeat if repeat else ''}: {message}"
+            return p["scheduler"].add_structured(
+                delay_seconds=int(args.get("delay_seconds", 60)),
+                message=args.get("message", "Reminder!"),
+                repeat=args.get("repeat", ""),
+            )
         if intent == "scheduler.list"   and "scheduler" in p: return p["scheduler"]._list()
         if intent == "scheduler.cancel" and "scheduler" in p: return p["scheduler"]._cancel(f"cancel reminder {args.get('id','')}")
 
@@ -115,16 +99,13 @@ class Dispatcher:
         if intent == "launcher.workspace" and "launcher" in p: return p["launcher"]._launch_workspace(args.get("name", ""))
         if intent == "launcher.list"      and "launcher" in p: return p["launcher"]._list_workspaces(text)
 
-        # fallback → LLM full response
+        # fallback
         if "llm" in p:
             return p["llm"].run(text, memory)
         return "No handler found."
 
-    # ── main dispatch ────────────────────────────────────────────────────────────
-
     def dispatch(self, text: str, memory) -> str:
         if not self._use_llm_routing:
-            # Legacy keyword mode
             for _, plugin in self._plugins.items():
                 if plugin.matches(text):
                     return plugin.run(text, memory)
@@ -133,7 +114,6 @@ class Dispatcher:
         result = intent_router.classify(text)
         intent = result.get("intent", "llm.chat")
         args   = result.get("args", {})
-        debug  = __import__("core.config", fromlist=["get"]).get("debug", False)
-        if debug:
+        if get("debug", False):
             print(f"[router] intent={intent}  args={args}")
         return self._route(intent, args, text, memory)
